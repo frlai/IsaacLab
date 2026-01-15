@@ -191,7 +191,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             obs, _, _, _ = env.step(actions)
 
     annotate.stop()
-    annotate.compile_graph(validate=False)
+    annotate.compile_graph()
 
     # close the simulator
     env.close()

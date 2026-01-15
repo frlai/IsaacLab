@@ -97,6 +97,44 @@ def _remove_articulation_annotations():
         setattr(ArticulationData, prop_name, original_prop)
 
 
+def configure_for_export():
+    """
+    Configures the environment managers for deterministic export.
+
+    This patches ObservationManager to disable noise/corruption during export.
+    Random operations like torch.rand_like in noise models cause validation
+    failures because they produce different values on each run.
+
+    IMPORTANT: Must be called BEFORE isaaclab_tasks is imported and before
+    annotate_observation_manager() and annotate_action_manager().
+    """
+    from isaaclab.managers.manager_term_cfg import ObservationGroupCfg
+
+    # Patch ObservationManager._prepare_terms to force disable noise
+    # This ensures deterministic outputs for export validation
+    original_prepare_terms = ObservationManager._prepare_terms
+
+    def patched_prepare_terms(self):
+        # Force disable corruption on all observation groups before preparing terms
+        # Iterate over config items the same way _prepare_terms does
+        if isinstance(self.cfg, dict):
+            group_cfg_items = self.cfg.items()
+        else:
+            group_cfg_items = self.cfg.__dict__.items()
+
+        for group_name, group_cfg in group_cfg_items:
+            if group_cfg is None:
+                continue
+            if isinstance(group_cfg, ObservationGroupCfg):
+                group_cfg.enable_corruption = False
+
+        # Call original _prepare_terms
+        return original_prepare_terms(self)
+
+    ObservationManager._prepare_terms = patched_prepare_terms
+    print("Configured for export: Disabled observation noise/corruption for deterministic export")
+
+
 def annotate_observation_manager():
     """
     Patches observation-related functions and classes to annotate inputs/outputs.
@@ -268,6 +306,8 @@ def add_leapp_annotations():
 
     IMPORTANT: Must be called BEFORE isaaclab_tasks is imported.
     """
+    # Configure for deterministic export first (disables noise/corruption)
+    configure_for_export()
     annotate_observation_manager()
     annotate_action_manager()
     print("All leapp annotations added")
