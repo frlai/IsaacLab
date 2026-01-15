@@ -9,6 +9,7 @@ from leapp import annotate
 from leapp.leapp_graph.traced_tensor import TracedTensor
 
 from isaaclab.assets.articulation.articulation_data import ArticulationData
+from isaaclab.controllers.operational_space import OperationalSpaceController
 from isaaclab.envs.mdp import observations
 from isaaclab.managers.action_manager import ActionManager
 from isaaclab.managers.observation_manager import ObservationManager
@@ -44,7 +45,6 @@ def _setup_articulation_data_annotations():
         # Joint state
         "joint_pos",  # joint_pos, joint_pos_rel, joint_pos_limit_normalized
         "joint_vel",  # joint_vel, joint_vel_rel
-        "applied_torque",  # joint_effort
     }
 
     for prop_name in observation_properties:
@@ -162,17 +162,57 @@ def annotate_action_manager():
     """
     Patches ActionManager.process_action to annotate action inputs/outputs.
 
-    Also collects static values (default_joint_stiffness and default_joint_damping)
-    from action terms that have them.
+    Also patches OperationalSpaceController.set_command for variable impedance tracing.
+
+    Collects static values (default_joint_stiffness and default_joint_damping)
+    from action terms that have them. For variable impedance controllers, the gains
+    are captured as dynamic outputs instead.
 
     IMPORTANT: Must be called BEFORE isaaclab_tasks is imported.
     """
+
+    # Patch OperationalSpaceController.set_command for variable impedance modes
+    # This must be done before ActionManager.process_action is patched
+    original_osc_set_command = OperationalSpaceController.set_command
+
+    def patched_osc_set_command(
+        self,
+        command: torch.Tensor,
+        current_ee_pose_b: torch.Tensor | None = None,
+        current_task_frame_pose_b: torch.Tensor | None = None,
+    ):
+        # For variable impedance modes, register gain buffers before in-place assignment
+        if self.cfg.impedance_mode in ["variable_kp", "variable"]:
+            # Register the gain tensors as buffers so in-place assignment is traced
+            self._motion_p_gains_task, self._motion_d_gains_task = annotate.register_buffer(
+                "action_manager",
+                {
+                    "motion_p_gains_task": self._motion_p_gains_task,
+                    "motion_d_gains_task": self._motion_d_gains_task,
+                },
+            )
+
+        # Call original set_command - in-place assignments will now be traced
+        return original_osc_set_command(self, command, current_ee_pose_b, current_task_frame_pose_b)
+
+    OperationalSpaceController.set_command = patched_osc_set_command
 
     # Patch ActionManager.process_action at class level
     original_process_action = ActionManager.process_action
 
     def patched_process_action(self, action: torch.Tensor):
         action = annotate.input_tensors({"actions": action}, node_name="action_manager")
+
+        # Register _raw_actions buffers for each action term before processing
+        # This enables tracing through in-place assignments like: self._raw_actions[:] = actions
+        for term_name, term_ in self._terms.items():
+            if hasattr(term_, "_raw_actions") and term_._raw_actions is not None:
+                buffers = annotate.register_buffer(
+                    "action_manager",
+                    {"raw_actions": term_._raw_actions},
+                )
+                term_._raw_actions = buffers["raw_actions"]
+
         original_process_action(self, action)
         annotate.mirror_leapp_tags(action, self._action)
         tensors = {}
@@ -180,6 +220,16 @@ def annotate_action_manager():
 
         for term_name, term_ in self._terms.items():
             tensors[term_name] = term_.processed_actions
+
+            # Check for dynamic gains from OperationalSpaceControllerAction
+            osc = getattr(term_, "_osc", None)
+            if osc is not None and hasattr(osc, "cfg"):
+                if osc.cfg.impedance_mode in ["variable", "variable_kp"]:
+                    # Dynamic gains - these are now traced due to register_buffer
+                    # Extract diagonal elements (the actual gain values)
+                    tensors[f"{term_name}_kp_gains"] = torch.diagonal(osc._motion_p_gains_task, dim1=-2, dim2=-1)
+                    tensors[f"{term_name}_kd_gains"] = torch.diagonal(osc._motion_d_gains_task, dim1=-2, dim2=-1)
+                    continue  # Skip static gain collection for this term
 
             # Collect static values (kp/kd gains) if available
             asset = getattr(term_, "_asset", None)
@@ -205,7 +255,7 @@ def annotate_action_manager():
 
     ActionManager.process_action = patched_process_action
 
-    print("Patched action manager: ActionManager.process_action")
+    print("Patched action manager: ActionManager.process_action, OperationalSpaceController.set_command")
 
 
 def add_leapp_annotations():
@@ -214,7 +264,7 @@ def add_leapp_annotations():
 
     This is the main entry point that patches:
     - ObservationManager and related observation functions
-    - ActionManager.process_action
+    - ActionManager.process_action (includes OperationalSpaceController.set_command)
 
     IMPORTANT: Must be called BEFORE isaaclab_tasks is imported.
     """
