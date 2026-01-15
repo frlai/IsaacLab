@@ -1,3 +1,8 @@
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
 """Script to export a checkpoint if an RL agent from RSL-RL."""
 
 """Launch Isaac Sim Simulator first."""
@@ -5,12 +10,13 @@
 import argparse
 import sys
 
+from leapp import annotate
+
 from isaaclab.app import AppLauncher
 
 # local imports
 import cli_args  # isort: skip
 
-from leapp import annotate
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
@@ -54,6 +60,9 @@ import os
 import time
 import torch
 
+# IMPORTANT: Add leapp annotations BEFORE importing isaaclab_tasks
+# This ensures the patched functions are captured when configs are created
+from annotate_functions_for_export import add_leapp_annotations
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 
 from isaaclab.envs import (
@@ -64,14 +73,10 @@ from isaaclab.envs import (
     multi_agent_to_single_agent,
 )
 from isaaclab.utils.assets import retrieve_file_path
-from isaaclab.utils.dict import print_dict
 
 from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper, export_policy_as_jit, export_policy_as_onnx
 from isaaclab_rl.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
 
-# IMPORTANT: Add leapp annotations BEFORE importing isaaclab_tasks
-# This ensures the patched functions are captured when configs are created
-from annotate_functions_for_export import add_leapp_annotations
 add_leapp_annotations()
 
 import isaaclab_tasks  # noqa: F401
@@ -175,8 +180,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # run everything in inference mode
         with torch.inference_mode():
             # agent stepping
-            with annotate.block('policy', inputs=['obs'], outputs=['actions'],
-                                backend_params={'model_path': onnx_path, 'copy_original_model': True}):
+            with annotate.block(
+                "policy",
+                inputs=["obs"],
+                outputs=["actions"],
+                backend_params={"model_path": onnx_path, "copy_original_model": True},
+            ):
                 actions = policy(obs)
             # env stepping
             obs, _, _, _ = env.step(actions)

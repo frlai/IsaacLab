@@ -1,10 +1,17 @@
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+import torch
+
 from leapp import annotate
-from isaaclab.managers.action_manager import ActionManager
+from leapp.leapp_graph.traced_tensor import TracedTensor
+
 from isaaclab.assets.articulation.articulation_data import ArticulationData
 from isaaclab.envs.mdp import observations
+from isaaclab.managers.action_manager import ActionManager
 from isaaclab.managers.observation_manager import ObservationManager
-from leapp.leapp_graph.traced_tensor import TracedTensor
-import torch
 
 # Global storage for original and annotating ArticulationData properties
 _articulation_data_originals = {}
@@ -20,27 +27,24 @@ def _setup_articulation_data_annotations():
     access these properties.
     """
 
-
     # All observation properties - we can include all of them now since annotations
     # are only active during compute_group
     observation_properties = {
         # Root state (position, orientation, velocities)
-        'root_pos_w',           # base_pos_z, root_pos_w
-        'root_quat_w',          # root_quat_w
-        'root_lin_vel_b',       # base_lin_vel
-        'root_ang_vel_b',       # base_ang_vel
-        'root_lin_vel_w',       # root_lin_vel_w
-        'root_ang_vel_w',       # root_ang_vel_w
-        'projected_gravity_b',  # 'projected_gravity_b',
-
+        "root_pos_w",  # base_pos_z, root_pos_w
+        "root_quat_w",  # root_quat_w
+        "root_lin_vel_b",  # base_lin_vel
+        "root_ang_vel_b",  # base_ang_vel
+        "root_lin_vel_w",  # root_lin_vel_w
+        "root_ang_vel_w",  # root_ang_vel_w
+        "projected_gravity_b",  # 'projected_gravity_b',
         # Body state
-        'body_pose_w',          # body_pose_w
-        'body_quat_w',          # body_projected_gravity_b
-
+        "body_pose_w",  # body_pose_w
+        "body_quat_w",  # body_projected_gravity_b
         # Joint state
-        'joint_pos',            # joint_pos, joint_pos_rel, joint_pos_limit_normalized
-        'joint_vel',            # joint_vel, joint_vel_rel
-        'applied_torque',       # joint_effort
+        "joint_pos",  # joint_pos, joint_pos_rel, joint_pos_limit_normalized
+        "joint_vel",  # joint_vel, joint_vel_rel
+        "applied_torque",  # joint_effort
     }
 
     for prop_name in observation_properties:
@@ -66,23 +70,16 @@ def _setup_articulation_data_annotations():
             def annotating_fget(self):
                 result = original(self)
                 if isinstance(result, torch.Tensor):
-                    result = annotate.input_tensors(
-                        {name: result},
-                        node_name='observation_manager'
-                    )
+                    result = annotate.input_tensors({name: result}, node_name="observation_manager")
                 return result
+
             return annotating_fget
 
         annotating_fget = make_annotating_fget(original_fget, prop_name)
         annotating_fget.__doc__ = original_fget.__doc__
 
         # Create annotating property
-        annotating_property = property(
-            fget=annotating_fget,
-            fset=attr.fset,
-            fdel=attr.fdel,
-            doc=attr.__doc__
-        )
+        annotating_property = property(fget=annotating_fget, fset=attr.fset, fdel=attr.fdel, doc=attr.__doc__)
         _articulation_data_annotating[prop_name] = annotating_property
 
     print(f"Prepared {len(_articulation_data_originals)} ArticulationData properties for temporary annotation")
@@ -120,7 +117,7 @@ def annotate_observation_manager():
 
     def patched_last_action(env, action_name=None):
         result = original_last_action(env, action_name)
-        result = annotate.input_tensors({"last_actions": result}, node_name='observation_manager')
+        result = annotate.input_tensors({"last_actions": result}, node_name="observation_manager")
         return result
 
     # Patch generated_commands observation function
@@ -128,7 +125,7 @@ def annotate_observation_manager():
 
     def patched_generated_commands(env, command_name=None):
         result = original_generated_commands(env, command_name)
-        result = annotate.input_tensors({"commands": result}, node_name='observation_manager')
+        result = annotate.input_tensors({"commands": result}, node_name="observation_manager")
         return result
 
     # Apply observation function patches at module level
@@ -149,7 +146,7 @@ def annotate_observation_manager():
         _apply_articulation_annotations()
         try:
             output = original_compute_group(self, *args, **kwargs)
-            annotate.output_tensors('observation_manager', output, export_with='torch', use_trace=True)
+            annotate.output_tensors("observation_manager", output, export_with="torch", use_trace=True)
             if isinstance(output, TracedTensor):
                 return output.tensor
             else:
@@ -175,7 +172,7 @@ def annotate_action_manager():
     original_process_action = ActionManager.process_action
 
     def patched_process_action(self, action: torch.Tensor):
-        action = annotate.input_tensors({"actions": action}, node_name='action_manager')
+        action = annotate.input_tensors({"actions": action}, node_name="action_manager")
         original_process_action(self, action)
         annotate.mirror_leapp_tags(action, self._action)
         tensors = {}
@@ -185,26 +182,26 @@ def annotate_action_manager():
             tensors[term_name] = term_.processed_actions
 
             # Collect static values (kp/kd gains) if available
-            asset = getattr(term_, '_asset', None)
-            if asset is not None and hasattr(asset, 'data'):
+            asset = getattr(term_, "_asset", None)
+            if asset is not None and hasattr(asset, "data"):
                 data = asset.data
-                joint_ids = getattr(term_, '_joint_ids', None)
+                joint_ids = getattr(term_, "_joint_ids", None)
 
                 # Get default_joint_stiffness (kp gains)
-                if hasattr(data, 'default_joint_stiffness') and data.default_joint_stiffness is not None:
+                if hasattr(data, "default_joint_stiffness") and data.default_joint_stiffness is not None:
                     if joint_ids is not None:
                         static_values[f"{term_name}_kp_gains"] = data.default_joint_stiffness[:, joint_ids]
                     else:
                         static_values[f"{term_name}_kp_gains"] = data.default_joint_stiffness
 
                 # Get default_joint_damping (kd gains)
-                if hasattr(data, 'default_joint_damping') and data.default_joint_damping is not None:
+                if hasattr(data, "default_joint_damping") and data.default_joint_damping is not None:
                     if joint_ids is not None:
                         static_values[f"{term_name}_kd_gains"] = data.default_joint_damping[:, joint_ids]
                     else:
                         static_values[f"{term_name}_kd_gains"] = data.default_joint_damping
 
-        annotate.output_tensors('action_manager', tensors, static_outputs=static_values, export_with='torch')
+        annotate.output_tensors("action_manager", tensors, static_outputs=static_values, export_with="torch")
 
     ActionManager.process_action = patched_process_action
 
