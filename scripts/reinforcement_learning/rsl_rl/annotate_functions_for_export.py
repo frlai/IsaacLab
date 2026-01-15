@@ -1,4 +1,10 @@
 from leapp import annotate
+from isaaclab.managers.action_manager import ActionManager
+from isaaclab.assets.articulation.articulation_data import ArticulationData
+from isaaclab.envs.mdp import observations
+from isaaclab.managers.observation_manager import ObservationManager
+from leapp.leapp_graph.traced_tensor import TracedTensor
+import torch
 
 # Global storage for original and annotating ArticulationData properties
 _articulation_data_originals = {}
@@ -13,8 +19,7 @@ def _setup_articulation_data_annotations():
     avoiding conflicts with rewards, terminations, commands, and actions that also
     access these properties.
     """
-    from isaaclab.assets.articulation.articulation_data import ArticulationData
-    import torch
+
 
     # All observation properties - we can include all of them now since annotations
     # are only active during compute_group
@@ -43,11 +48,11 @@ def _setup_articulation_data_annotations():
 
         # Skip if attribute doesn't exist or isn't a property
         if attr is None or not isinstance(attr, property):
-            continue
+            raise ValueError(f"Attribute {prop_name} does not exist or is not a property")
 
         # Skip properties without a getter
         if attr.fget is None:
-            continue
+            raise ValueError(f"Attribute {prop_name} does not have a getter")
 
         # Store the original property
         _articulation_data_originals[prop_name] = attr
@@ -85,14 +90,12 @@ def _setup_articulation_data_annotations():
 
 def _apply_articulation_annotations():
     """Temporarily applies annotating versions of ArticulationData properties."""
-    from isaaclab.assets.articulation.articulation_data import ArticulationData
     for prop_name, annotating_prop in _articulation_data_annotating.items():
         setattr(ArticulationData, prop_name, annotating_prop)
 
 
 def _remove_articulation_annotations():
     """Restores original ArticulationData properties."""
-    from isaaclab.assets.articulation.articulation_data import ArticulationData
     for prop_name, original_prop in _articulation_data_originals.items():
         setattr(ArticulationData, prop_name, original_prop)
 
@@ -108,9 +111,6 @@ def annotate_observation_manager():
 
     IMPORTANT: Must be called BEFORE isaaclab_tasks is imported.
     """
-    from isaaclab.envs.mdp import observations
-    from isaaclab.managers.observation_manager import ObservationManager
-    from leapp.leapp_graph.traced_tensor import TracedTensor
 
     # Prepare (but don't apply) ArticulationData annotations
     _setup_articulation_data_annotations()
@@ -128,7 +128,7 @@ def annotate_observation_manager():
 
     def patched_generated_commands(env, command_name=None):
         result = original_generated_commands(env, command_name)
-        result = annotate.input_tensors({"pose_command": result}, node_name='observation_manager')
+        result = annotate.input_tensors({"commands": result}, node_name='observation_manager')
         return result
 
     # Apply observation function patches at module level
@@ -149,7 +149,7 @@ def annotate_observation_manager():
         _apply_articulation_annotations()
         try:
             output = original_compute_group(self, *args, **kwargs)
-            annotate.output_tensors(output, node_name='observation_manager', export_with='torch', use_trace=True)
+            annotate.output_tensors('observation_manager', output, export_with='torch', use_trace=True)
             if isinstance(output, TracedTensor):
                 return output.tensor
             else:
@@ -165,10 +165,11 @@ def annotate_action_manager():
     """
     Patches ActionManager.process_action to annotate action inputs/outputs.
 
+    Also collects static values (default_joint_stiffness and default_joint_damping)
+    from action terms that have them.
+
     IMPORTANT: Must be called BEFORE isaaclab_tasks is imported.
     """
-    from isaaclab.managers.action_manager import ActionManager
-    import torch
 
     # Patch ActionManager.process_action at class level
     original_process_action = ActionManager.process_action
@@ -176,10 +177,34 @@ def annotate_action_manager():
     def patched_process_action(self, action: torch.Tensor):
         action = annotate.input_tensors({"actions": action}, node_name='action_manager')
         original_process_action(self, action)
+        annotate.mirror_leapp_tags(action, self._action)
         tensors = {}
+        static_values = {}
+
         for term_name, term_ in self._terms.items():
             tensors[term_name] = term_.processed_actions
-        annotate.output_tensors(tensors, node_name='action_manager', export_with='torch')
+
+            # Collect static values (kp/kd gains) if available
+            asset = getattr(term_, '_asset', None)
+            if asset is not None and hasattr(asset, 'data'):
+                data = asset.data
+                joint_ids = getattr(term_, '_joint_ids', None)
+
+                # Get default_joint_stiffness (kp gains)
+                if hasattr(data, 'default_joint_stiffness') and data.default_joint_stiffness is not None:
+                    if joint_ids is not None:
+                        static_values[f"{term_name}_kp_gains"] = data.default_joint_stiffness[:, joint_ids]
+                    else:
+                        static_values[f"{term_name}_kp_gains"] = data.default_joint_stiffness
+
+                # Get default_joint_damping (kd gains)
+                if hasattr(data, 'default_joint_damping') and data.default_joint_damping is not None:
+                    if joint_ids is not None:
+                        static_values[f"{term_name}_kd_gains"] = data.default_joint_damping[:, joint_ids]
+                    else:
+                        static_values[f"{term_name}_kd_gains"] = data.default_joint_damping
+
+        annotate.output_tensors('action_manager', tensors, static_outputs=static_values, export_with='torch')
 
     ActionManager.process_action = patched_process_action
 

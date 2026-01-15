@@ -1,4 +1,4 @@
-"""Script to play a checkpoint if an RL agent from RSL-RL."""
+"""Script to export a checkpoint if an RL agent from RSL-RL."""
 
 """Launch Isaac Sim Simulator first."""
 
@@ -167,11 +167,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # Note: all patching is done at module/class level before isaaclab_tasks import
     annotate.start(task_name)
     obs = env.get_observations()
-    for key, val in obs.items():
-        if hasattr(val, 'leapp_tag'):
-            print('FRANK DEBUG', key, 'tag:', val.leapp_tag)
-        else:
-            print('FRANK DEBUG', key, 'no tag')
     # simulate environment
     while not simulation_app.is_running():
         time.sleep(0.5)
@@ -187,7 +182,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             obs, _, _, _ = env.step(actions)
 
     annotate.stop()
-    annotate.compile_graph()
+    annotate.compile_graph(validate=False)
 
     # close the simulator
     env.close()
