@@ -19,6 +19,54 @@ from isaaclab.managers.observation_manager import ObservationManager
 _articulation_data_originals = {}
 _articulation_data_annotating = {}
 
+# Global mapping built during execution: observation_function_name -> [articulation_property_names]
+OBSERVATION_TO_ARTICULATION_MAP: dict[str, list[str]] = {}
+
+
+def _record_articulation_access(observation_name: str, articulation_property: str):
+    """Record that an observation function accessed an ArticulationData property."""
+    if observation_name not in OBSERVATION_TO_ARTICULATION_MAP:
+        OBSERVATION_TO_ARTICULATION_MAP[observation_name] = []
+    if articulation_property not in OBSERVATION_TO_ARTICULATION_MAP[observation_name]:
+        OBSERVATION_TO_ARTICULATION_MAP[observation_name].append(articulation_property)
+
+
+def get_observation_to_articulation_map() -> dict[str, list[str]]:
+    """Get a copy of the observation-to-articulation mapping.
+
+    Returns:
+        A dictionary mapping observation function names to lists of
+        ArticulationData property names (leapp input names) they access.
+
+        Example:
+            {
+                'base_lin_vel': ['root_lin_vel_b'],
+                'joint_pos_rel': ['joint_pos'],
+                'last_action': ['last_actions'],
+                'generated_commands': ['commands'],
+            }
+    """
+    return OBSERVATION_TO_ARTICULATION_MAP.copy()
+
+
+def _find_calling_observation_function() -> str | None:
+    """Walk up the call stack to find the observation function that triggered this access."""
+    for frame_info in inspect.stack():
+        # Look for frames in the observations module
+        if "isaaclab/envs/mdp/observations" in frame_info.filename:
+            func_name = frame_info.function
+            # Skip internal/wrapper functions
+            if not func_name.startswith("_"):
+                return func_name
+
+        # Also check for custom observation functions in user code
+        # Could look for functions with _has_descriptor attribute
+        frame_locals = frame_info.frame.f_locals
+        if "self" in frame_locals and hasattr(frame_locals.get("self"), "_has_descriptor"):
+            return frame_info.function
+
+    return None
+
 
 def _setup_articulation_data_annotations():
     """
@@ -65,13 +113,19 @@ def _setup_articulation_data_annotations():
         # Create annotating getter
         original_fget = attr.fget
 
-        def make_annotating_fget(original, name):
+        def make_annotating_fget(original, prop_name):
             """Factory function to properly capture variables in closure."""
 
             def annotating_fget(self):
                 result = original(self)
+
+                # Find which observation function called us and record the mapping
+                observation_name = _find_calling_observation_function()
+                if observation_name:
+                    _record_articulation_access(observation_name, prop_name)
+
                 if isinstance(result, torch.Tensor):
-                    result = annotate.input_tensors({name: result}, node_name="observation_manager")
+                    result = annotate.input_tensors({prop_name: result}, node_name="observation_manager")
                 return result
 
             return annotating_fget
@@ -157,6 +211,8 @@ def annotate_observation_manager():
     def patched_last_action(env, action_name=None, **kwargs):
         # Pass through kwargs (including 'inspect' for IO descriptors)
         result = original_last_action(env, action_name, **kwargs)
+        # Record the mapping for this custom observation
+        _record_articulation_access("last_action", "last_actions")
         result = annotate.input_tensors({"last_actions": result}, node_name="observation_manager")
         return result
 
@@ -172,7 +228,10 @@ def annotate_observation_manager():
     def patched_generated_commands(env, command_name=None, **kwargs):
         # Pass through kwargs (including 'inspect' for IO descriptors)
         result = original_generated_commands(env, command_name, **kwargs)
-        result = annotate.input_tensors({"commands": result}, node_name="observation_manager")
+        # Record the mapping for this custom observation (use command_name as the leapp input name)
+        leapp_input_name = command_name if command_name else "commands"
+        _record_articulation_access("generated_commands", leapp_input_name)
+        result = annotate.input_tensors({leapp_input_name: result}, node_name="observation_manager")
         return result
 
     # Preserve original signature and IO descriptor to pass manager validation checks

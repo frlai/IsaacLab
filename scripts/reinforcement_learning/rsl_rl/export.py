@@ -63,7 +63,7 @@ import torch
 
 # IMPORTANT: Add leapp annotations BEFORE importing isaaclab_tasks
 # This ensures the patched functions are captured when configs are created
-from annotate_functions_for_export import add_leapp_annotations
+from annotate_functions_for_export import add_leapp_annotations, get_observation_to_articulation_map
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 
 from isaaclab.envs import (
@@ -200,12 +200,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     out_actions = outs["actions"]
     out_scene = outs["scene"]
 
+    # Get the auto-discovered mapping from observation functions to leapp inputs
+    obs_to_leapp_map = get_observation_to_articulation_map()
+
     observations = []
     for k in out_observations:
+        obs_name = k["name"]
         observation = {
-            "name": k["name"],
-            "full_path": k["full_path"],
+            "name": obs_name,
         }
+        # Add the leapp input names this observation maps to (copy list to avoid YAML anchors)
+        if obs_name in obs_to_leapp_map:
+            observation["leapp_inputs"] = list(obs_to_leapp_map[obs_name])
         if "joint_names" in k:
             observation["joint_names"] = k["joint_names"]
         if "units" in k["extras"]:
@@ -216,11 +222,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     for k in out_actions:
         action = {
             "name": k["name"],
-            "full_path": k["full_path"],
         }
         if "joint_names" in k:
             action["joint_names"] = k["joint_names"]
+        if "units" in k["extras"]:
+            observation["units"] = k["extras"]["units"]
         actions.append(action)
+
     semantic = {
         "observations": observations,
         "actions": actions,
