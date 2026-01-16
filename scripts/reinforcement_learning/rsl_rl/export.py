@@ -61,13 +61,7 @@ import os
 import time
 import torch
 
-# IMPORTANT: Add leapp annotations BEFORE importing isaaclab_tasks
-# This ensures the patched functions are captured when configs are created
-from annotate_functions_for_export import (
-    add_leapp_annotations,
-    get_action_io_to_term_map,
-    get_observation_to_articulation_map,
-)
+from export_annotator import ExportAnnotator
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 
 from isaaclab.envs import (
@@ -86,11 +80,18 @@ import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
+# IMPORTANT: Add leapp annotations BEFORE importing isaaclab_tasks
+# This ensures the patched functions are captured when configs are created
+# from annotate_functions_for_export import (
+#     add_leapp_annotations,
+#     get_action_io_to_term_map,
+#     get_observation_to_articulation_map,
+# )
+
 
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     """Export a RSL-RL agent."""
-    add_leapp_annotations()
     # grab task name for checkpoint path
     task_name = args_cli.task.split(":")[-1]
     train_task_name = task_name.replace("-Play", "")
@@ -126,6 +127,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # create isaac environment
     # Note: observation functions are already patched at module level (before isaaclab_tasks import)
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+    annotator = ExportAnnotator(env)
+    annotator.setup()
 
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv):
@@ -197,50 +200,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     annotate.stop()
     annotate.compile_graph()
 
-    outs = env.unwrapped.get_IO_descriptors
-    # only export the policy observations
-    out_observations = outs["observations"]["policy"]
-    out_actions = outs["actions"]
-    out_scene = outs["scene"]
-
-    # Get the auto-discovered mapping from observation functions to leapp inputs
-    obs_to_leapp_map = get_observation_to_articulation_map()
-    action_to_leapp_map = get_action_io_to_term_map()
-
-    observations = []
-    for k in out_observations:
-        obs_name = k["name"]
-        observation = {
-            "name": obs_name,
-        }
-        # Add the leapp input names this observation maps to (copy list to avoid YAML anchors)
-        if obs_name in obs_to_leapp_map:
-            observation["leapp_inputs"] = list(obs_to_leapp_map[obs_name])
-        if "joint_names" in k:
-            observation["joint_names"] = k["joint_names"]
-        if "units" in k["extras"]:
-            observation["units"] = k["extras"]["units"]
-        observations.append(observation)
-
-    actions = []
-    for k in out_actions:
-        action_name = k["name"]
-        action = {
-            "name": action_name,
-        }
-        if action_name in action_to_leapp_map:
-            action["leapp_inputs"] = list(action_to_leapp_map[action_name])
-        if "joint_names" in k:
-            action["joint_names"] = k["joint_names"]
-        if "units" in k["extras"]:
-            observation["units"] = k["extras"]["units"]
-        actions.append(action)
-
-    semantic = {
-        "observations": observations,
-        "actions": actions,
-        "scene": out_scene,
-    }
+    semantic = annotator.get_semantic
 
     with open(annotate.config_path, "a") as f:
         yaml.dump({"semantic": semantic}, f)
