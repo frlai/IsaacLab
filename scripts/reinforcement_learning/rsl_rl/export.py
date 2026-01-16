@@ -63,7 +63,11 @@ import torch
 
 # IMPORTANT: Add leapp annotations BEFORE importing isaaclab_tasks
 # This ensures the patched functions are captured when configs are created
-from annotate_functions_for_export import add_leapp_annotations, get_observation_to_articulation_map
+from annotate_functions_for_export import (
+    add_leapp_annotations,
+    get_action_io_to_term_map,
+    get_observation_to_articulation_map,
+)
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 
 from isaaclab.envs import (
@@ -78,8 +82,6 @@ from isaaclab.utils.assets import retrieve_file_path
 from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper, export_policy_as_jit, export_policy_as_onnx
 from isaaclab_rl.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
 
-add_leapp_annotations()
-
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
@@ -88,6 +90,7 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     """Export a RSL-RL agent."""
+    add_leapp_annotations()
     # grab task name for checkpoint path
     task_name = args_cli.task.split(":")[-1]
     train_task_name = task_name.replace("-Play", "")
@@ -202,6 +205,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # Get the auto-discovered mapping from observation functions to leapp inputs
     obs_to_leapp_map = get_observation_to_articulation_map()
+    action_to_leapp_map = get_action_io_to_term_map()
 
     observations = []
     for k in out_observations:
@@ -220,9 +224,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     actions = []
     for k in out_actions:
+        action_name = k["name"]
         action = {
-            "name": k["name"],
+            "name": action_name,
         }
+        if action_name in action_to_leapp_map:
+            action["leapp_inputs"] = list(action_to_leapp_map[action_name])
         if "joint_names" in k:
             action["joint_names"] = k["joint_names"]
         if "units" in k["extras"]:

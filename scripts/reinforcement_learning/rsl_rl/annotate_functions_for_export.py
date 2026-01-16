@@ -20,15 +20,28 @@ _articulation_data_originals = {}
 _articulation_data_annotating = {}
 
 # Global mapping built during execution: observation_function_name -> [articulation_property_names]
-OBSERVATION_TO_ARTICULATION_MAP: dict[str, list[str]] = {}
+OBSERVATION_TO_ARTICULATION_MAP: dict[str, set[str]] = {}
+
+# Global mapping built during execution: io_descriptor_name -> term_name (leapp output name)
+# Maps the semantic action name (from IO descriptor) to the action_manager output name
+ACTION_IO_TO_TERM_MAP: dict[str, str] = {}
 
 
 def _record_articulation_access(observation_name: str, articulation_property: str):
     """Record that an observation function accessed an ArticulationData property."""
     if observation_name not in OBSERVATION_TO_ARTICULATION_MAP:
-        OBSERVATION_TO_ARTICULATION_MAP[observation_name] = []
-    if articulation_property not in OBSERVATION_TO_ARTICULATION_MAP[observation_name]:
-        OBSERVATION_TO_ARTICULATION_MAP[observation_name].append(articulation_property)
+        OBSERVATION_TO_ARTICULATION_MAP[observation_name] = set()
+    OBSERVATION_TO_ARTICULATION_MAP[observation_name].add(articulation_property)
+
+
+def _record_action_io_mapping(io_descriptor_name: str, term_name: str):
+    """Record the mapping from IO descriptor name to action term name.
+
+    Args:
+        io_descriptor_name: The name from the action's IO descriptor (e.g., 'joint_position_action')
+        term_name: The action term name used in action_manager outputs (e.g., 'arm_action')
+    """
+    ACTION_IO_TO_TERM_MAP[io_descriptor_name] = [term_name]
 
 
 def get_observation_to_articulation_map() -> dict[str, list[str]]:
@@ -46,7 +59,25 @@ def get_observation_to_articulation_map() -> dict[str, list[str]]:
                 'generated_commands': ['commands'],
             }
     """
-    return OBSERVATION_TO_ARTICULATION_MAP.copy()
+    return {k: list(v) for k, v in OBSERVATION_TO_ARTICULATION_MAP.items()}
+
+
+def get_action_io_to_term_map() -> dict[str, str]:
+    """Get a copy of the action IO descriptor to term name mapping.
+
+    Returns:
+        A dictionary mapping action IO descriptor names to action term names
+        (which are used as leapp output names in action_manager).
+
+        Example:
+            {
+                'joint_position_action': 'arm_action',
+            }
+
+        This allows the semantic.actions section in the YAML to map:
+        - name: joint_position_action  ->  leapp_outputs: [arm_action]
+    """
+    return ACTION_IO_TO_TERM_MAP.copy()
 
 
 def _find_calling_observation_function() -> str | None:
@@ -325,13 +356,23 @@ def annotate_action_manager():
                 )
                 term_._raw_actions = buffers["raw_actions"]
 
+        # run the original process action
         original_process_action(self, action)
+
         annotate.mirror_leapp_tags(action, self._action)
         tensors = {}
         static_values = {}
 
         for term_name, term_ in self._terms.items():
             tensors[term_name] = term_.processed_actions
+
+            # Record the mapping: IO descriptor name -> term name (leapp output)
+            # e.g., 'joint_position_action' -> 'arm_action'
+            try:
+                io_descriptor_name = term_.IO_descriptor.name
+                _record_action_io_mapping(io_descriptor_name, term_name)
+            except Exception:
+                pass  # Skip if IO descriptor is not available
 
             # Check for dynamic gains from OperationalSpaceControllerAction
             osc = getattr(term_, "_osc", None)
