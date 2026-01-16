@@ -9,6 +9,7 @@
 
 import argparse
 import sys
+import yaml
 
 from leapp import annotate
 
@@ -192,6 +193,42 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     annotate.stop()
     annotate.compile_graph()
+
+    outs = env.unwrapped.get_IO_descriptors
+    # only export the policy observations
+    out_observations = outs["observations"]["policy"]
+    out_actions = outs["actions"]
+    out_scene = outs["scene"]
+
+    observations = []
+    for k in out_observations:
+        observation = {
+            "name": k["name"],
+            "full_path": k["full_path"],
+        }
+        if "joint_names" in k:
+            observation["joint_names"] = k["joint_names"]
+        if "units" in k["extras"]:
+            observation["units"] = k["extras"]["units"]
+        observations.append(observation)
+
+    actions = []
+    for k in out_actions:
+        action = {
+            "name": k["name"],
+            "full_path": k["full_path"],
+        }
+        if "joint_names" in k:
+            action["joint_names"] = k["joint_names"]
+        actions.append(action)
+    semantic = {
+        "observations": observations,
+        "actions": actions,
+        "scene": out_scene,
+    }
+
+    with open(annotate.config_path, "a") as f:
+        yaml.dump({"semantic": semantic}, f)
 
     # close the simulator
     env.close()

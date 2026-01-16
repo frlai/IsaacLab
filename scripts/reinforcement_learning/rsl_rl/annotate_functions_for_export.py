@@ -3,6 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+import inspect
 import torch
 
 from leapp import annotate
@@ -153,18 +154,32 @@ def annotate_observation_manager():
     # Patch last_action observation function
     original_last_action = observations.last_action
 
-    def patched_last_action(env, action_name=None):
-        result = original_last_action(env, action_name)
+    def patched_last_action(env, action_name=None, **kwargs):
+        # Pass through kwargs (including 'inspect' for IO descriptors)
+        result = original_last_action(env, action_name, **kwargs)
         result = annotate.input_tensors({"last_actions": result}, node_name="observation_manager")
         return result
+
+    # Preserve original signature and IO descriptor to pass manager validation checks
+    patched_last_action.__signature__ = inspect.signature(original_last_action)
+    if hasattr(original_last_action, "_descriptor"):
+        patched_last_action._descriptor = original_last_action._descriptor
+        patched_last_action._has_descriptor = original_last_action._has_descriptor
 
     # Patch generated_commands observation function
     original_generated_commands = observations.generated_commands
 
-    def patched_generated_commands(env, command_name=None):
-        result = original_generated_commands(env, command_name)
+    def patched_generated_commands(env, command_name=None, **kwargs):
+        # Pass through kwargs (including 'inspect' for IO descriptors)
+        result = original_generated_commands(env, command_name, **kwargs)
         result = annotate.input_tensors({"commands": result}, node_name="observation_manager")
         return result
+
+    # Preserve original signature and IO descriptor to pass manager validation checks
+    patched_generated_commands.__signature__ = inspect.signature(original_generated_commands)
+    if hasattr(original_generated_commands, "_descriptor"):
+        patched_generated_commands._descriptor = original_generated_commands._descriptor
+        patched_generated_commands._has_descriptor = original_generated_commands._has_descriptor
 
     # Apply observation function patches at module level
     # Note: Observation functions that use ArticulationData properties (base_pos_z, root_pos_w,
