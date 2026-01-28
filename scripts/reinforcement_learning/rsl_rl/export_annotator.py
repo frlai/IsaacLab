@@ -206,7 +206,7 @@ class ExportAnnotator:
             self._apply_articulation_annotations()
             try:
                 output = self._original_compute_group(*args, **kwargs)
-                annotate.output_tensors("observation_manager", output, export_with="torch", use_trace=True)
+                annotate.output_tensors("observation_manager", output, export_with="onnx", use_trace=True)
                 return output.tensor if isinstance(output, TracedTensor) else output
             finally:
                 self._remove_articulation_annotations()
@@ -240,7 +240,7 @@ class ExportAnnotator:
             annotate.mirror_leapp_tags(action, action_manager._action)
 
             tensors, static_values = self._collect_action_outputs(action_manager)
-            annotate.output_tensors("action_manager", tensors, static_outputs=static_values, export_with="torch")
+            annotate.output_tensors("action_manager", tensors, static_outputs=static_values, export_with="onnx")
 
         action_manager.process_action = patched_process_action
 
