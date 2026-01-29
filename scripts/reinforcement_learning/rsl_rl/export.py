@@ -127,7 +127,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # create isaac environment
     # Note: observation functions are already patched at module level (before isaaclab_tasks import)
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
-    annotator = ExportAnnotator(env)
+    annotator = ExportAnnotator(env, task_name=task_name)
     annotator.setup()
 
     # convert to single-agent instance if required by the RL algorithm
@@ -186,14 +186,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     for _ in range(5):
         # run everything in inference mode
         with torch.inference_mode():
-            # agent stepping
-            with annotate.block(
-                "policy",
-                inputs=["obs"],
-                outputs=["actions"],
-                backend_params={"model_path": onnx_path, "copy_original_model": True},
-            ):
-                actions = policy(obs)
+            actions = policy(obs)
             # env stepping
             obs, _, _, _ = env.step(actions)
 

@@ -3,11 +3,6 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-# Copyright (c) 2022-2026, The Isaac Lab Project Developers
-# All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
-
-
 """Export annotations for Isaac Lab policies using instance-level patching."""
 
 
@@ -19,7 +14,6 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from leapp import annotate
-from leapp.leapp_graph.traced_tensor import TracedTensor
 
 from isaaclab.assets.articulation.articulation_data import ArticulationData
 
@@ -42,6 +36,7 @@ class ExportAnnotator:
     """
 
     env: ManagerBasedEnv
+    task_name: str
 
     io_descriptor_observations: list[Any] = field(default_factory=list)
     io_descriptor_actions: list[Any] = field(default_factory=list)
@@ -165,7 +160,7 @@ class ExportAnnotator:
         def patched_last_action(env, action_name=None, **kwargs):
             result = original_func(env, action_name, **kwargs)
             self._record_articulation_access("last_action", "last_actions")
-            result = annotate.input_tensors({"last_actions": result}, node_name="observation_manager")
+            result = annotate.input_tensors({"last_actions": result}, node_name=self.task_name)
             return result
 
         patched_last_action.__name__ = original_func.__name__
@@ -181,7 +176,7 @@ class ExportAnnotator:
             # Use command_name parameter, or fall back to config, or default
             leapp_input_name = command_name or command_name_from_cfg or "commands"
             self._record_articulation_access("generated_commands", leapp_input_name)
-            result = annotate.input_tensors({leapp_input_name: result}, node_name="observation_manager")
+            result = annotate.input_tensors({leapp_input_name: result}, node_name=self.task_name)
             return result
 
         patched_generated_commands.__name__ = original_func.__name__
@@ -205,9 +200,7 @@ class ExportAnnotator:
         def patched_compute_group(*args, **kwargs):
             self._apply_articulation_annotations()
             try:
-                output = self._original_compute_group(*args, **kwargs)
-                annotate.output_tensors("observation_manager", output, export_with="onnx", use_trace=True)
-                return output.tensor if isinstance(output, TracedTensor) else output
+                return self._original_compute_group(*args, **kwargs)
             finally:
                 self._remove_articulation_annotations()
 
@@ -228,19 +221,20 @@ class ExportAnnotator:
         self._original_process_action = action_manager.process_action
 
         def patched_process_action(action: torch.Tensor):
-            action = annotate.input_tensors({"actions": action}, node_name="action_manager")
 
             # Register raw_actions buffers for tracing
             for term_name, term in action_manager._terms.items():
                 if hasattr(term, "_raw_actions") and term._raw_actions is not None:
-                    buffers = annotate.register_buffer("action_manager", {"raw_actions": term._raw_actions})
+                    buffers = annotate.register_buffer(self.task_name, {"raw_actions": term._raw_actions})
                     term._raw_actions = buffers["raw_actions"]
 
             self._original_process_action(action)
-            annotate.mirror_leapp_tags(action, action_manager._action)
+            # this is stored differently inside the original process action method that would loose tracing. this step preserves it.
+            action_manager._action = action.clone()
 
             tensors, static_values = self._collect_action_outputs(action_manager)
-            annotate.output_tensors("action_manager", tensors, static_outputs=static_values, export_with="onnx")
+            tensors["last_action"] = action_manager._action
+            annotate.output_tensors(self.task_name, tensors, static_outputs=static_values, export_with="onnx")
 
         action_manager.process_action = patched_process_action
 
@@ -313,7 +307,7 @@ class ExportAnnotator:
                     return self._annotated_tensor_cache[prop_name].clone()
 
                 # First access - annotate and cache
-                result = annotate.input_tensors({prop_name: result}, node_name="observation_manager")
+                result = annotate.input_tensors({prop_name: result}, node_name=self.task_name)
                 self._annotated_tensor_cache[prop_name] = result
 
             return result
