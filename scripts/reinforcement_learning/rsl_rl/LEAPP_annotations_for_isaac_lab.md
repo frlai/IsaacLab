@@ -6,9 +6,7 @@ Export RSL-RL reinforcement learning pipelines as portable processing graphs usi
 
 | File | Description |
 |------|-------------|
-| `observation_manager.pt` | Observation processing (TorchScript) |
-| `policy.onnx` | Policy network (ONNX) |
-| `action_manager.pt` | Action processing (TorchScript) |
+| `<taskname>.onnx` | Policy network (ONNX) |
 | `<task_name>.yaml` | Pipeline configuration and metadata |
 | `<task_name>.png` | Visualization of the processing graph |
 
@@ -46,7 +44,7 @@ sample exported `Isaac-Reach-Franka-v0.yaml`:
 
 ```yaml
 models:
-  observation_manager:
+  Isaac-Reach-Franka-v0:
     inputs:
     - name: joint_pos
       dtype: float32
@@ -65,41 +63,11 @@ models:
       shape: [1, 7]
       type: tensor
     outputs:
-    - name: obs_policy
-      dtype: float32
-      shape: [1, 32]
-      type: tensor
-    parameters:
-      model_path: observation_manager.pt
-      md5sum: 3e44b3d2942d5fc3c6a88f28ef3d7b5a
-      sha256sum: 8d5761e8830be584ec09863775e9bef135e2ad081bcad3029ac1ab50a7fcf819
-      device: cuda
-      backend: torch
-  policy:
-    inputs:
-    - name: obs_policy
-      dtype: float32
-      shape: [1, 32]
-      type: tensor
-    outputs:
-    - name: actions
-      dtype: float32
-      shape: [1, 7]
-      type: tensor
-    parameters:
-      model_path: policy.onnx
-      md5sum: 848384ae8e4d22052d6e87719d8cb42c
-      sha256sum: e69cf132746a570e504eb23071ad9cddd146eafaa787adf5bc0951ed948a4bcc
-      device: cuda
-      backend: onnx
-  action_manager:
-    inputs:
-    - name: actions
-      dtype: float32
-      shape: [1, 7]
-      type: tensor
-    outputs:
     - name: arm_action
+      dtype: float32
+      shape: [1, 7]
+      type: tensor
+    - name: last_action
       dtype: float32
       shape: [1, 7]
       type: tensor
@@ -112,22 +80,20 @@ models:
       shape: [1, 7]
       type: tensor
     parameters:
-      model_path: action_manager.pt
-      md5sum: cbbed1862042f23bd285da4c0ddaa946
-      sha256sum: 20d31b74ab7dc686f29b4b973ef43b9950076dc5a3da40f417839d581c5b328e
+      model_path: Isaac-Reach-Franka-v0.onnx
+      md5sum: 38ee55fa7828b5068b86024206bd5ddb
+      sha256sum: c605a7076fde5c0d03a36f548d458d24bd543df67aac7675d463d29f870a7eb3
       device: cuda
-      backend: torch
+      backend: onnx
 
 pipeline:
-  data_flow:
-    observation_manager/obs_policy: [policy/obs_policy]
-    policy/actions: [action_manager/actions]
+  data_flow: {}
   feedback_flow:
-    policy/actions: [observation_manager/last_actions]
+    Isaac-Reach-Franka-v0/last_action: [Isaac-Reach-Franka-v0/last_actions]
   inputs:
-    observation_manager: [joint_pos, joint_vel, ee_pose]
+    Isaac-Reach-Franka-v0: [joint_pos, joint_vel, ee_pose]
   outputs:
-    action_manager: [arm_action, arm_action_kp_gains, arm_action_kd_gains]
+    Isaac-Reach-Franka-v0: [arm_action, arm_action_kp_gains, arm_action_kd_gains]
 
 system information:
   cuda version: '12.8'
@@ -188,4 +154,5 @@ semantic:
     decimation: 2
     dt: 0.03333333333333333
     physics_dt: 0.016666666666666666
+
 ```
