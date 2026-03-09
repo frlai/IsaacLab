@@ -11,7 +11,7 @@ import argparse
 import sys
 import yaml
 
-from leapp import annotate
+import leapp
 
 from isaaclab.app import AppLauncher
 
@@ -177,7 +177,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # start annotation tracing
     # Note: all patching is done at module/class level before isaaclab_tasks import
-    annotate.start(task_name)
+    leapp.start(task_name, save_path=export_model_dir)
     obs = env.get_observations()
     # simulate environment
     while not simulation_app.is_running():
@@ -190,12 +190,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # env stepping
             obs, _, _, _ = env.step(actions)
 
-    annotate.stop()
-    annotate.compile_graph()
+    leapp.stop()
+    leapp.compile_graph()
 
     semantic = annotator.get_semantic
+    config_path = os.path.join(export_model_dir, task_name, f"{task_name}.yaml")
 
-    with open(annotate.config_path, "a") as f:
+    with open(config_path, "a") as f:
         yaml.dump({"semantic": semantic}, f)
 
     # close the simulator
