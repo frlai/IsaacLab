@@ -9,7 +9,6 @@
 
 import argparse
 import sys
-import yaml
 
 import leapp
 
@@ -192,12 +191,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     leapp.stop()
     leapp.compile_graph()
-
-    semantic = annotator.get_semantic
-    config_path = os.path.join(export_model_dir, task_name, f"{task_name}.yaml")
-
-    with open(config_path, "a") as f:
-        yaml.dump({"semantic": semantic}, f)
 
     # close the simulator
     env.close()

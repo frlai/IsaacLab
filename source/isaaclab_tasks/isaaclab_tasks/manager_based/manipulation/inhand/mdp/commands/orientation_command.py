@@ -73,6 +73,9 @@ class InHandReOrientationCommand(CommandTerm):
         self.metrics["position_error"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["consecutive_success"] = torch.zeros(self.num_envs, device=self.device)
 
+        self.cfg.cmd_hint = self.cfg.cmd_hint or "command/body/pose"
+        self.cfg.element_names = self.cfg.element_names or ["x", "y", "z", "qw", "qx", "qy", "qz"]
+
     def __str__(self) -> str:
         msg = "InHandManipulationCommandGenerator:\n"
         msg += f"\tCommand dimension: {tuple(self.command.shape[1:])}\n"

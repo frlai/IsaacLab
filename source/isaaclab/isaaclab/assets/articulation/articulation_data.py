@@ -12,6 +12,7 @@ from isaacsim.core.simulation_manager import SimulationManager
 
 import isaaclab.utils.math as math_utils
 from isaaclab.utils.buffers import TimestampedBuffer
+from isaaclab.utils.leapp_semantics import leapp_tensor_semantics
 
 # import logger
 logger = logging.getLogger(__name__)
@@ -104,16 +105,16 @@ class ArticulationData:
     # Names.
     ##
 
-    body_names: list[str] = None
+    body_names: list[str] | None = None
     """Body names in the order parsed by the simulation view."""
 
-    joint_names: list[str] = None
+    joint_names: list[str] | None = None
     """Joint names in the order parsed by the simulation view."""
 
-    fixed_tendon_names: list[str] = None
+    fixed_tendon_names: list[str] | None = None
     """Fixed tendon names in the order parsed by the simulation view."""
 
-    spatial_tendon_names: list[str] = None
+    spatial_tendon_names: list[str] | None = None
     """Spatial tendon names in the order parsed by the simulation view."""
 
     ##
@@ -732,7 +733,7 @@ class ArticulationData:
 
         if self._body_incoming_joint_wrench_b.timestamp < self._sim_timestamp:
             self._body_incoming_joint_wrench_b.data = self._root_physx_view.get_link_incoming_joint_force()
-            self._body_incoming_joint_wrench_b.time_stamp = self._sim_timestamp
+            self._body_incoming_joint_wrench_b.timestamp = self._sim_timestamp
         return self._body_incoming_joint_wrench_b.data
 
     ##
@@ -740,6 +741,7 @@ class ArticulationData:
     ##
 
     @property
+    @leapp_tensor_semantics(kind="state/joint/position", element_names_source="joint_names")
     def joint_pos(self):
         """Joint positions of all joints. Shape is (num_instances, num_joints)."""
         if self._joint_pos.timestamp < self._sim_timestamp:
@@ -749,6 +751,7 @@ class ArticulationData:
         return self._joint_pos.data
 
     @property
+    @leapp_tensor_semantics(kind="state/joint/velocity", element_names_source="joint_names")
     def joint_vel(self):
         """Joint velocities of all joints. Shape is (num_instances, num_joints)."""
         if self._joint_vel.timestamp < self._sim_timestamp:
@@ -774,6 +777,7 @@ class ArticulationData:
     ##
 
     @property
+    @leapp_tensor_semantics(kind="state/body/projected_gravity", element_names_source="xyz")
     def projected_gravity_b(self):
         """Projection of the gravity direction on base frame. Shape is (num_instances, 3)."""
         return math_utils.quat_apply_inverse(self.root_link_quat_w, self.GRAVITY_VEC_W)
@@ -997,16 +1001,19 @@ class ArticulationData:
     ##
 
     @property
+    @leapp_tensor_semantics(kind="state/body/pose", element_names_source="pose7")
     def root_pose_w(self) -> torch.Tensor:
         """Same as :attr:`root_link_pose_w`."""
         return self.root_link_pose_w
 
     @property
+    @leapp_tensor_semantics(kind="state/body/position", element_names_source="xyz")
     def root_pos_w(self) -> torch.Tensor:
         """Same as :attr:`root_link_pos_w`."""
         return self.root_link_pos_w
 
     @property
+    @leapp_tensor_semantics(kind="state/body/rotation", element_names_source="quat_wxyz")
     def root_quat_w(self) -> torch.Tensor:
         """Same as :attr:`root_link_quat_w`."""
         return self.root_link_quat_w
@@ -1017,26 +1024,31 @@ class ArticulationData:
         return self.root_com_vel_w
 
     @property
+    @leapp_tensor_semantics(kind="state/body/linear_velocity", element_names_source="xyz")
     def root_lin_vel_w(self) -> torch.Tensor:
         """Same as :attr:`root_com_lin_vel_w`."""
         return self.root_com_lin_vel_w
 
     @property
+    @leapp_tensor_semantics(kind="state/body/angular_velocity", element_names_source="xyz")
     def root_ang_vel_w(self) -> torch.Tensor:
         """Same as :attr:`root_com_ang_vel_w`."""
         return self.root_com_ang_vel_w
 
     @property
+    @leapp_tensor_semantics(kind="state/body/linear_velocity", element_names_source="xyz")
     def root_lin_vel_b(self) -> torch.Tensor:
         """Same as :attr:`root_com_lin_vel_b`."""
         return self.root_com_lin_vel_b
 
     @property
+    @leapp_tensor_semantics(kind="state/body/angular_velocity", element_names_source="xyz")
     def root_ang_vel_b(self) -> torch.Tensor:
         """Same as :attr:`root_com_ang_vel_b`."""
         return self.root_com_ang_vel_b
 
     @property
+    @leapp_tensor_semantics(kind="state/body/pose", element_names_source="body_pose")
     def body_pose_w(self) -> torch.Tensor:
         """Same as :attr:`body_link_pose_w`."""
         return self.body_link_pose_w
@@ -1047,6 +1059,7 @@ class ArticulationData:
         return self.body_link_pos_w
 
     @property
+    @leapp_tensor_semantics(kind="state/body/rotation", element_names_source="body_quat")
     def body_quat_w(self) -> torch.Tensor:
         """Same as :attr:`body_link_quat_w`."""
         return self.body_link_quat_w
