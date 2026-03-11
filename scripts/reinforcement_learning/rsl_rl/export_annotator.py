@@ -3,14 +3,24 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Export annotations for Isaac Lab policies using instance-level patching."""
+"""Export annotations for Isaac Lab policies using proxy-based patching.
 
+Observation and action annotation is achieved by routing calls through lightweight
+proxy objects rather than globally patching class methods. This means:
+
+- Observation term functions see an _EnvProxy whose scene returns _ArticulationProxy
+  objects with annotating data getters. The real env / data is shared and unmodified.
+
+- Action terms have their ``_asset`` attribute replaced with an _ArticulationWriteProxy
+  that intercepts ``_leapp_semantics``-decorated write methods and records outputs.
+  The real Articulation class is never patched.
+"""
 
 from __future__ import annotations
 
 import inspect
 import torch
-from dataclasses import dataclass, field
+from contextlib import suppress
 from typing import TYPE_CHECKING
 
 from leapp import annotate
@@ -24,318 +34,465 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
 
 
-# class ObservationPatcher:
+# ══════════════════════════════════════════════════════════════════
+# Observation-side proxies
+# ══════════════════════════════════════════════════════════════════
 
-# class ActionPatcher:
 
+class _ArticulationDataProxy:
+    """Proxy around a real ArticulationData that intercepts annotated property reads.
 
-@dataclass
-class ExportAnnotator:
-    """Encapsulates all leapp annotation logic for exporting Isaac Lab policies.
+    For properties whose getter carries ``_leapp_semantics``, the proxy calls
+    the annotating getter (which records the tensor with LEAPP) and caches the
+    result for deduplication within a single ``compute_group`` call.
 
-    Usage:
-        env = gym.make(...)
-        annotator = ExportAnnotator(env)
-        annotator.setup()
-        # ... run policy ...
-        annotator.cleanup()
+    All other attribute access is forwarded transparently to the real object.
     """
 
-    env: ManagerBasedEnv
-    task_name: str
+    def __init__(self, real_data: ArticulationData, annotating_getters: dict[str, callable], cache: dict):
+        object.__setattr__(self, "_real_data", real_data)
+        object.__setattr__(self, "_annotating_getters", annotating_getters)
+        object.__setattr__(self, "_cache", cache)
 
-    # Original methods for restoration
-    _original_compute_group: callable = field(default=None, repr=False)
-    _original_process_action: callable = field(default=None, repr=False)
-    _original_apply_action: callable = field(default=None, repr=False)
+    def __getattr__(self, name):
+        """Intercept annotated properties; forward everything else."""
+        getters = object.__getattribute__(self, "_annotating_getters")
+        if name in getters:
+            cache = object.__getattribute__(self, "_cache")
+            if name in cache:
+                return cache[name].clone()
+            real_data = object.__getattribute__(self, "_real_data")
+            result = getters[name](real_data)
+            cache[name] = result
+            return result
+        return getattr(object.__getattribute__(self, "_real_data"), name)
 
-    # ArticulationData patching state
-    _articulation_originals: dict[str, property] = field(default_factory=dict, repr=False)
-    _articulation_annotating: dict[str, property] = field(default_factory=dict, repr=False)
-    _annotations_active: bool = field(default=False, repr=False)
 
-    # Action writer patching state
-    _action_write_originals: dict[str, callable] = field(default_factory=dict, repr=False)
-    _action_write_annotating: dict[str, callable] = field(default_factory=dict, repr=False)
-    _action_write_annotations_active: bool = field(default=False, repr=False)
+class _ArticulationProxy:
+    """Proxy around a real Articulation that returns _ArticulationDataProxy for ``.data``.
 
-    # Cache for annotated tensors within a single compute_group call
-    # Prevents duplicate input tensors when same property is accessed multiple times
-    _annotated_tensor_cache: dict[str, torch.Tensor] = field(default_factory=dict, repr=False)
+    All other attribute access is forwarded transparently to the real asset.
+    """
 
-    _action_output_cache: list[TensorSemantics] = field(default_factory=list, repr=False)
-    _active_action_term_name: str | None = field(default=None, repr=False)
-    _pending_action_output_export: bool = field(default=False, repr=False)
+    def __init__(self, real_asset: Articulation, data_proxy: _ArticulationDataProxy):
+        object.__setattr__(self, "_real_asset", real_asset)
+        object.__setattr__(self, "_data_proxy", data_proxy)
 
-    def setup(self):
-        """Set up all annotations. Call after env is created."""
-        self._setup_observation_annotations()
-        self._prepare_action_write_annotations()
-        self._patch_action_manager()
+    @property
+    def data(self):
+        """Return the annotating data proxy instead of the real ArticulationData."""
+        return object.__getattribute__(self, "_data_proxy")
 
-    def cleanup(self):
-        """Restore all original methods and properties."""
-        self._restore_observation_annotations()
-        self._restore_action_manager()
-        self._remove_action_write_annotations()
+    def __getattr__(self, name):
+        """Forward all non-data attribute access to the real asset."""
+        return getattr(object.__getattribute__(self, "_real_asset"), name)
 
-    # ──────────────────────────────────────────────────────────────────
-    # Observation Annotations
-    # ──────────────────────────────────────────────────────────────────
 
-    def _setup_observation_annotations(self):
-        """Set up all observation-side annotations."""
-        self._disable_observation_noise()
-        self._prepare_articulation_annotations()
-        self._patch_observation_functions()
-        self._patch_observation_manager()
+class _SceneProxy:
+    """Proxy around the real InteractiveScene.
 
-    def _restore_observation_annotations(self):
-        """Restore all observation-side patches and temporary annotations."""
-        self._restore_observation_functions()
-        self._restore_observation_manager()
-        self._remove_articulation_annotations()
+    When an observation term looks up an asset by name, this proxy lazily wraps
+    Articulation entities in _ArticulationProxy so their data getters annotate.
+    Non-Articulation entities are returned as-is.
+    """
 
-    def _disable_observation_noise(self):
-        """Disable noise/corruption for deterministic export.
+    def __init__(self, real_scene, annotating_getters: dict[str, callable], cache: dict):
+        object.__setattr__(self, "_real_scene", real_scene)
+        object.__setattr__(self, "_annotating_getters", annotating_getters)
+        object.__setattr__(self, "_cache", cache)
+        object.__setattr__(self, "_proxied", {})
 
-        Since we patch after env creation, we need to set term_cfg.noise = None
-        directly on each term config (not just the group config).
+    def __getitem__(self, key):
+        """Return an ArticulationProxy for Articulation entities, real entity otherwise."""
+        proxied = object.__getattribute__(self, "_proxied")
+        if key in proxied:
+            return proxied[key]
+        real_scene = object.__getattribute__(self, "_real_scene")
+        entity = real_scene[key]
+        if isinstance(entity, Articulation):
+            getters = object.__getattribute__(self, "_annotating_getters")
+            cache = object.__getattribute__(self, "_cache")
+            data_proxy = _ArticulationDataProxy(entity.data, getters, cache)
+            proxy = _ArticulationProxy(entity, data_proxy)
+            proxied[key] = proxy
+            return proxy
+        return entity
+
+    def __getattr__(self, name):
+        """Forward all other scene access to the real scene."""
+        return getattr(object.__getattribute__(self, "_real_scene"), name)
+
+
+class _EnvProxy:
+    """Proxy around the real env that returns a _SceneProxy for ``.scene``.
+
+    All other attribute access (``num_envs``, ``command_manager``, etc.)
+    is forwarded transparently to the real env.
+    """
+
+    def __init__(self, real_env, scene_proxy: _SceneProxy):
+        object.__setattr__(self, "_real_env", real_env)
+        object.__setattr__(self, "_scene_proxy", scene_proxy)
+
+    @property
+    def scene(self):
+        """Return the scene proxy instead of the real scene."""
+        return object.__getattribute__(self, "_scene_proxy")
+
+    def __getattr__(self, name):
+        """Forward all non-scene attribute access to the real env."""
+        return getattr(object.__getattribute__(self, "_real_env"), name)
+
+
+# ══════════════════════════════════════════════════════════════════
+# Action-side proxy
+# ══════════════════════════════════════════════════════════════════
+
+
+class _ArticulationWriteProxy:
+    """Proxy around a real Articulation that intercepts ``_leapp_semantics`` write methods.
+
+    When an action term calls e.g. ``self._asset.set_joint_position_target(target, joint_ids)``,
+    this proxy:
+
+    1. Calls the real method on the real asset (so the simulation sees the write).
+    2. Snapshots the ``target`` tensor and records a ``TensorSemantics`` entry in the
+       shared output cache.
+
+    All other attribute access is forwarded transparently to the real asset.
+    """
+
+    def __init__(
+        self,
+        real_asset: Articulation,
+        term_name: str,
+        output_cache: list[TensorSemantics],
+        annotating_methods: dict[str, callable],
+    ):
+        object.__setattr__(self, "_real_asset", real_asset)
+        object.__setattr__(self, "_term_name", term_name)
+        object.__setattr__(self, "_output_cache", output_cache)
+        object.__setattr__(self, "_annotating_methods", annotating_methods)
+
+    def __getattr__(self, name):
+        """Return an annotating wrapper for _leapp_semantics methods; forward everything else."""
+        methods = object.__getattribute__(self, "_annotating_methods")
+        if name in methods:
+            real_asset = object.__getattribute__(self, "_real_asset")
+            term_name = object.__getattribute__(self, "_term_name")
+            output_cache = object.__getattribute__(self, "_output_cache")
+            original_method = getattr(real_asset, name)
+            return methods[name](real_asset, original_method, term_name, output_cache)
+        return getattr(object.__getattribute__(self, "_real_asset"), name)
+
+
+# ══════════════════════════════════════════════════════════════════
+# ObservationPatcher
+# ══════════════════════════════════════════════════════════════════
+
+
+class ObservationPatcher:
+    """Permanently patches observation term functions to annotate their inputs via proxies.
+
+    Instead of globally patching ArticulationData properties and toggling them on/off,
+    this scans for ``_leapp_semantics``-decorated properties once, builds annotating
+    getters, and routes observation term calls through lightweight proxy objects that
+    share the same underlying env and tensor state.
+    """
+
+    def __init__(self, task_name: str):
+        self.task_name = task_name
+        self._annotated_tensor_cache: dict[str, torch.Tensor] = {}
+
+    def setup(self, obs_manager):
+        """Patch all observation terms to use annotating proxies.
+
+        For each term in the observation manager:
+        - Normal terms get their ``env`` argument swapped for a proxy env.
+        - ``last_action`` and ``generated_commands`` get dedicated wrappers.
+        - Noise is disabled on every term for deterministic export.
+
+        A thin wrapper on ``compute_group`` clears the dedup cache between calls.
         """
-        obs_manager = self.env.env.unwrapped.observation_manager
+        real_env = obs_manager._env
 
-        # Disable noise on each individual term config
-        for _, term_cfgs in obs_manager._group_obs_term_cfgs.items():
-            for term_cfg in term_cfgs:
-                term_cfg.noise = None
+        annotating_getters = self._build_annotating_getters()
+        scene_proxy = _SceneProxy(real_env.scene, annotating_getters, self._annotated_tensor_cache)
+        proxy_env = _EnvProxy(real_env, scene_proxy)
 
-    def _patch_observation_functions(self):
-        """Patch observation functions inside the observation manager's term configs.
-
-        These functions (last_action, generated_commands) don't access ArticulationData
-        properties, so they need separate patching to record their mappings and annotate
-        their outputs.
-
-        We patch the term_cfg.func directly because the observation manager stores
-        references to these functions at creation time.
-        """
-        obs_manager = self.env.env.unwrapped.observation_manager
-
-        # Store original functions for restoration: (group_name, term_idx) -> original_func
-        self._original_obs_funcs: dict[tuple[str, int], callable] = {}
-
-        # find and patch all other known non-articulation data properties
         for group_name, term_cfgs in obs_manager._group_obs_term_cfgs.items():
-            for term_idx, term_cfg in enumerate(term_cfgs):
+            for term_cfg in term_cfgs:
                 original_func = term_cfg.func
                 func_name = getattr(original_func, "__name__", None)
 
                 if func_name == "last_action":
-                    self._original_obs_funcs[(group_name, term_idx)] = original_func
-                    term_cfg.func = self._make_patched_last_action(original_func)
-
+                    term_cfg.func = self._wrap_last_action(original_func)
                 elif func_name == "generated_commands":
-                    self._original_obs_funcs[(group_name, term_idx)] = original_func
-                    term_cfg.func = self._make_patched_generated_commands(original_func, term_cfg)
+                    term_cfg.func = self._wrap_generated_commands(original_func, term_cfg)
+                else:
+                    term_cfg.func = self._wrap_with_proxy(original_func, proxy_env)
 
-    def _make_patched_last_action(self, original_func):
-        """Create a patched version of last_action for LEAPP tracing."""
+                term_cfg.noise = None
 
-        def patched_last_action(env, action_name=None, **kwargs):
+        original_compute_group = obs_manager.compute_group
+        cache = self._annotated_tensor_cache
+
+        def patched_compute_group(*args, **kwargs):
+            """Clear the tensor dedup cache, then run the real compute_group."""
+            cache.clear()
+            return original_compute_group(*args, **kwargs)
+
+        obs_manager.compute_group = patched_compute_group
+
+    # ── Scanning ──────────────────────────────────────────────────
+
+    def _build_annotating_getters(self) -> dict[str, callable]:
+        """Scan ArticulationData for ``_leapp_semantics`` properties and build annotating getters.
+
+        Returns a dict mapping property name to a callable ``(data_self) -> annotated_tensor``.
+        """
+        getters: dict[str, callable] = {}
+        for prop_name in dir(ArticulationData):
+            prop = getattr(ArticulationData, prop_name, None)
+            if isinstance(prop, property) and prop.fget and hasattr(prop.fget, "_leapp_semantics"):
+                getters[prop_name] = self._make_annotating_getter(prop.fget, prop_name)
+        return getters
+
+    def _make_annotating_getter(self, original_fget, prop_name: str):
+        """Create an annotating getter callable for a single ArticulationData property.
+
+        The returned callable invokes the real getter, then registers the result
+        as a LEAPP input tensor with the property's semantic metadata.
+        """
+        task_name = self.task_name
+
+        def getter(data_self):
+            result = original_fget(data_self)
+            if not isinstance(result, torch.Tensor):
+                return result
+            semantics_meta = getattr(original_fget, "_leapp_semantics", None)
+            sem = TensorSemantics(
+                name=prop_name,
+                ref=result,
+                kind=semantics_meta.kind if semantics_meta else None,
+                element_names=resolve_leapp_element_names(semantics_meta, data_self),
+            )
+            return annotate.input_tensors(task_name, sem)
+
+        return getter
+
+    # ── Term wrappers ─────────────────────────────────────────────
+
+    @staticmethod
+    def _wrap_with_proxy(original_func, proxy_env):
+        """Wrap a term function so it receives the proxy env instead of the real env.
+
+        This is the generic wrapper for observation terms that read ArticulationData
+        properties. By substituting the env, the entire downstream chain
+        (env.scene[name].data.property) goes through the proxy.
+        """
+
+        def wrapped(env, **kwargs):
+            return original_func(proxy_env, **kwargs)
+
+        wrapped.__name__ = getattr(original_func, "__name__", "unknown")
+        return wrapped
+
+    def _wrap_last_action(self, original_func):
+        """Wrap the ``last_action`` observation term to annotate its output as a LEAPP input."""
+        task_name = self.task_name
+
+        def wrapped(env, action_name=None, **kwargs):
             result = original_func(env, action_name, **kwargs)
-            result = annotate.input_tensors(self.task_name, {"last_actions": result})
-            return result
+            return annotate.input_tensors(task_name, {"last_actions": result})
 
-        patched_last_action.__name__ = original_func.__name__
-        return patched_last_action
+        wrapped.__name__ = original_func.__name__
+        return wrapped
 
-    def _make_patched_generated_commands(self, original_func, term_cfg):
-        """Create a patched version of generated_commands for LEAPP tracing."""
-        # Get the command_name from term_cfg.params if available
+    def _wrap_generated_commands(self, original_func, term_cfg):
+        """Wrap the ``generated_commands`` observation term to annotate its output as a LEAPP input.
+
+        Resolves command semantics (kind, element_names) from the command manager
+        configuration when available.
+        """
+        task_name = self.task_name
         command_name_from_cfg = term_cfg.params.get("command_name")
 
-        def patched_generated_commands(env, command_name=None, **kwargs):
+        def wrapped(env, command_name=None, **kwargs):
             result = original_func(env, command_name, **kwargs)
-            # Use command_name parameter, or fall back to config, or default
             leapp_input_name = command_name or command_name_from_cfg or "commands"
             command_cfg = None
-            try:
+            with suppress(AttributeError, KeyError):
                 command_cfg = env.command_manager.get_term(leapp_input_name).cfg
-            except (AttributeError, KeyError):
-                # Keep export working even if the observation term doesn't point to a registered command term.
-                command_cfg = None
-
-            semantics = TensorSemantics(
+            sem = TensorSemantics(
                 name=leapp_input_name,
                 ref=result,
                 kind=getattr(command_cfg, "cmd_hint", None),
                 element_names=getattr(command_cfg, "element_names", None),
             )
-            result = annotate.input_tensors(self.task_name, semantics)
-            return result
+            return annotate.input_tensors(task_name, sem)
 
-        patched_generated_commands.__name__ = original_func.__name__
-        return patched_generated_commands
+        wrapped.__name__ = original_func.__name__
+        return wrapped
 
-    def _restore_observation_functions(self):
-        """Restore original observation functions in term configs."""
-        if not hasattr(self, "_original_obs_funcs"):
-            return
 
-        obs_manager = self.env.env.unwrapped.observation_manager
+# ══════════════════════════════════════════════════════════════════
+# ActionPatcher
+# ══════════════════════════════════════════════════════════════════
 
-        for (group_name, term_idx), original_func in self._original_obs_funcs.items():
-            obs_manager._group_obs_term_cfgs[group_name][term_idx].func = original_func
 
-    def _patch_observation_manager(self):
-        """Patch the observation manager instance's compute_group method."""
-        obs_manager = self.env.env.unwrapped.observation_manager
-        self._original_compute_group = obs_manager.compute_group
+class ActionPatcher:
+    """Permanently patches action terms to annotate their outputs via proxies.
 
-        def patched_compute_group(*args, **kwargs):
-            self._apply_articulation_annotations()
-            try:
-                return self._original_compute_group(*args, **kwargs)
-            finally:
-                self._remove_articulation_annotations()
+    1. Scans Articulation for ``_leapp_semantics``-decorated methods once.
+    2. Replaces each action term's ``_asset`` with an ``_ArticulationWriteProxy`` that
+       intercepts those methods and records output semantics.
+    3. Patches ``process_action`` and ``apply_action`` on the action manager instance
+       to coordinate buffer registration and the single ``annotate.output_tensors`` call.
 
-        obs_manager.compute_group = patched_compute_group
+    No Articulation class methods are ever modified.
+    """
 
-    def _restore_observation_manager(self):
-        """Restore original compute_group method."""
-        if self._original_compute_group:
-            self.env.env.unwrapped.observation_manager.compute_group = self._original_compute_group
+    def __init__(self, task_name: str):
+        self.task_name = task_name
+        self._action_output_cache: list[TensorSemantics] = []
+        self._pending_action_output_export: bool = False
 
-    # ──────────────────────────────────────────────────────────────────
-    # ArticulationData Property Annotations
-    # ──────────────────────────────────────────────────────────────────
+    def setup(self, action_manager):
+        """Patch all action terms and the action manager for LEAPP annotation.
 
-    def _prepare_articulation_annotations(self):
-        """Prepare annotating versions of ArticulationData properties."""
-        for prop_name in self._get_semantic_articulation_properties():
-            original_prop = getattr(ArticulationData, prop_name, None)
-            if not isinstance(original_prop, property) or original_prop.fget is None:
-                continue
+        For each action term with an Articulation asset, replaces ``term._asset``
+        with an ``_ArticulationWriteProxy``. Then patches ``process_action`` and
+        ``apply_action`` on the manager instance.
+        """
+        annotating_methods = self._build_annotating_write_methods()
 
-            self._articulation_originals[prop_name] = original_prop
-            self._articulation_annotating[prop_name] = self._make_annotating_property(original_prop, prop_name)
+        for term_name, term in action_manager._terms.items():
+            asset = getattr(term, "_asset", None)
+            if isinstance(asset, Articulation):
+                term._asset = _ArticulationWriteProxy(
+                    real_asset=asset,
+                    term_name=term_name,
+                    output_cache=self._action_output_cache,
+                    annotating_methods=annotating_methods,
+                )
 
-    def _make_annotating_property(self, original: property, prop_name: str) -> property:
-        """Create an annotating version of an ArticulationData property."""
-        original_fget = original.fget
-        assert original_fget is not None  # Checked in _prepare_articulation_annotations
+        self._patch_manager_methods(action_manager)
 
-        def annotating_fget(data_self):
-            result = original_fget(data_self)
+    # ── Scanning ──────────────────────────────────────────────────
 
-            if isinstance(result, torch.Tensor):
-                # Check if this property was already annotated in this compute_group call
-                if prop_name in self._annotated_tensor_cache:
-                    # Return a clone of the cached tensor to avoid duplicate input annotations
-                    return self._annotated_tensor_cache[prop_name].clone()
+    def _build_annotating_write_methods(self) -> dict[str, callable]:
+        """Scan Articulation for ``_leapp_semantics`` methods and build interceptors.
 
-                sem = self._make_property_semantics(prop_name, data_self, result)
+        Returns a dict mapping method name to a factory callable. The factory takes
+        ``(real_asset, original_bound_method, term_name, output_cache)`` and returns
+        a callable that the proxy returns in ``__getattr__``.
+        """
+        methods: dict[str, callable] = {}
+        for method_name in dir(Articulation):
+            method = getattr(Articulation, method_name, None)
+            if callable(method) and hasattr(method, "_leapp_semantics"):
+                methods[method_name] = self._make_write_interceptor_factory(method, method_name)
+        return methods
 
-                # First access - annotate and cache
-                result = annotate.input_tensors(self.task_name, sem)
-                self._annotated_tensor_cache[prop_name] = result
+    def _make_write_interceptor_factory(self, original_unbound, method_name: str):
+        """Create a factory that produces bound annotating wrappers for a single write method.
 
-            return result
+        The factory is called by ``_ArticulationWriteProxy.__getattr__`` each time the
+        method is accessed. It returns a callable that:
 
-        return property(fget=annotating_fget, fset=original.fset, fdel=original.fdel, doc=original.__doc__)
+        1. Calls the real method on the real asset.
+        2. Inspects the ``target`` argument.
+        3. Records a ``TensorSemantics`` entry in the shared output cache.
+        """
+        signature = inspect.signature(original_unbound)
+        semantics = getattr(original_unbound, "_leapp_semantics", None)
 
-    def _apply_articulation_annotations(self):
-        """Temporarily apply annotating properties."""
-        if not self._annotations_active:
-            # Clear the tensor cache at the start of each compute_group call
-            self._annotated_tensor_cache.clear()
-            for prop_name, prop in self._articulation_annotating.items():
-                setattr(ArticulationData, prop_name, prop)
-            self._annotations_active = True
+        def factory(real_asset: Articulation, original_bound, term_name: str, output_cache: list):
 
-    def _remove_articulation_annotations(self):
-        """Restore original properties."""
-        if self._annotations_active:
-            for prop_name, prop in self._articulation_originals.items():
-                setattr(ArticulationData, prop_name, prop)
-            self._annotations_active = False
-            # Clear the tensor cache when done
-            self._annotated_tensor_cache.clear()
+            def interceptor(*args, **kwargs):
+                result = original_bound(*args, **kwargs)
+                bound_args = signature.bind_partial(real_asset, *args, **kwargs)
+                target = bound_args.arguments.get("target")
 
-    # ──────────────────────────────────────────────────────────────────
-    # Action Manager
-    # ──────────────────────────────────────────────────────────────────
+                if isinstance(target, torch.Tensor):
+                    tensor_target: torch.Tensor = target
+                    output_name = _unique_output_name(term_name, method_name, output_cache)
+                    joint_ids = bound_args.arguments.get("joint_ids")
+                    output_cache.append(
+                        TensorSemantics(
+                            name=output_name,
+                            ref=tensor_target.clone(),
+                            kind=semantics.kind if semantics is not None else None,
+                            element_names=resolve_leapp_element_names(
+                                semantics,
+                                _JointNameContext(real_asset.joint_names, joint_ids),
+                            ),
+                        )
+                    )
 
-    def _patch_action_manager(self):
-        """Patch the action manager instance's action processing methods."""
-        action_manager = self.env.env.unwrapped.action_manager
-        self._original_process_action = action_manager.process_action
-        self._original_apply_action = action_manager.apply_action
+                return result
+
+            return interceptor
+
+        return factory
+
+    # ── Manager patches ───────────────────────────────────────────
+
+    def _patch_manager_methods(self, action_manager):
+        """Patch ``process_action`` and ``apply_action`` on the action manager instance.
+
+        ``process_action`` registers raw_action buffers for LEAPP tracing and
+        preserves the action tensor clone.
+
+        ``apply_action`` coordinates the output cache lifecycle: clear before,
+        collect and export after.
+        """
+        original_process = action_manager.process_action
+        original_apply = action_manager.apply_action
+        task_name = self.task_name
 
         def patched_process_action(action: torch.Tensor):
-            # Register raw_actions buffers for tracing
+            """Register raw_action buffers, call real process_action, preserve action clone."""
             for term_name, term in action_manager._terms.items():
                 if hasattr(term, "_raw_actions") and term._raw_actions is not None:
-                    term._raw_actions = annotate.register_buffer(self.task_name, {"raw_actions": term._raw_actions})
+                    term._raw_actions = annotate.register_buffer(task_name, {"raw_actions": term._raw_actions})
 
-            self._original_process_action(action)
-            # this is stored differently inside the original process action method that would loose tracing. this step preserves it.
+            original_process(action)
             action_manager._action = action.clone()
             self._pending_action_output_export = True
 
         def patched_apply_action():
+            """Clear cache, call real apply_action, collect outputs, call annotate.output_tensors."""
             if not self._pending_action_output_export:
-                return self._original_apply_action()
+                return original_apply()
 
-            original_term_apply_actions: dict[str, callable] = {}
             self._action_output_cache.clear()
-            self._apply_action_write_annotations()
+            original_apply()
 
-            try:
-                for term_name, term in action_manager._terms.items():
-                    original_term_apply_actions[term_name] = term.apply_actions
-                    term.apply_actions = self._make_patched_term_apply_actions(term.apply_actions, term_name)
-
-                self._original_apply_action()
-
-                self._action_output_cache.extend(self._collect_action_outputs(action_manager))
-                self._action_output_cache.append(TensorSemantics(name="last_action", ref=action_manager._action))
-                static_values = self._collect_action_static_outputs(action_manager)
-                annotate.output_tensors(
-                    self.task_name,
-                    self._action_output_cache,
-                    static_outputs=static_values,
-                    export_with="onnx",
-                )
-                self._pending_action_output_export = False
-            finally:
-                for term_name, original_apply_actions in original_term_apply_actions.items():
-                    action_manager._terms[term_name].apply_actions = original_apply_actions
-                self._active_action_term_name = None
-                self._remove_action_write_annotations()
-                self._action_output_cache.clear()
+            self._action_output_cache.extend(self._collect_action_outputs(action_manager))
+            self._action_output_cache.append(TensorSemantics(name="last_action", ref=action_manager._action))
+            static_values = self._collect_action_static_outputs(action_manager)
+            annotate.output_tensors(
+                task_name,
+                self._action_output_cache,
+                static_outputs=static_values,
+                export_with="onnx",
+            )
+            self._pending_action_output_export = False
+            self._action_output_cache.clear()
+            return None
 
         action_manager.process_action = patched_process_action
         action_manager.apply_action = patched_apply_action
 
-    def _make_patched_term_apply_actions(self, original_func, term_name: str):
-        """Wrap an action term's apply call to keep the current term context."""
+    # ── Output collection ─────────────────────────────────────────
 
-        def patched_apply_actions():
-            self._active_action_term_name = term_name
-            try:
-                return original_func()
-            finally:
-                self._active_action_term_name = None
-
-        return patched_apply_actions
-
-    def _collect_action_outputs(self, action_manager) -> list[TensorSemantics]:
-        """Collect non-writer action tensors that should still be exported."""
+    @staticmethod
+    def _collect_action_outputs(action_manager) -> list[TensorSemantics]:
+        """Collect non-writer action tensors that should be exported (e.g. OSC dynamic gains)."""
         tensors: list[TensorSemantics] = []
-
         for term_name, term in action_manager._terms.items():
-            # Handle variable impedance (dynamic gains)
             osc = getattr(term, "_osc", None)
             if osc and hasattr(osc, "cfg") and osc.cfg.impedance_mode in ["variable", "variable_kp"]:
                 tensors.append(
@@ -354,149 +511,83 @@ class ExportAnnotator:
                 )
         return tensors
 
-    def _collect_action_static_outputs(self, action_manager) -> dict:
-        """Collect static values from action terms."""
-        static_values = {}
+    @staticmethod
+    def _collect_action_static_outputs(action_manager) -> dict:
+        """Collect static kp/kd gain values from action terms for export metadata."""
+        static_values: dict = {}
         for term_name, term in action_manager._terms.items():
             osc = getattr(term, "_osc", None)
             if osc and hasattr(osc, "cfg") and osc.cfg.impedance_mode in ["variable", "variable_kp"]:
                 continue
             asset = getattr(term, "_asset", None)
-            if asset and hasattr(asset, "data"):
-                self._collect_static_gains(term_name, asset.data, getattr(term, "_joint_ids", None), static_values)
+            real_asset = getattr(asset, "_real_asset", asset)
+            if real_asset and hasattr(real_asset, "data"):
+                data = real_asset.data
+                joint_ids = getattr(term, "_joint_ids", None)
+                if hasattr(data, "default_joint_stiffness") and data.default_joint_stiffness is not None:
+                    gains = data.default_joint_stiffness
+                    static_values[f"{term_name}_kp_gains"] = gains[:, joint_ids] if joint_ids else gains
+                if hasattr(data, "default_joint_damping") and data.default_joint_damping is not None:
+                    gains = data.default_joint_damping
+                    static_values[f"{term_name}_kd_gains"] = gains[:, joint_ids] if joint_ids else gains
         return static_values
 
-    def _collect_static_gains(self, term_name: str, data, joint_ids, static_values: dict):
-        """Extract static kp/kd gains from asset data."""
-        if hasattr(data, "default_joint_stiffness") and data.default_joint_stiffness is not None:
-            gains = data.default_joint_stiffness
-            static_values[f"{term_name}_kp_gains"] = gains[:, joint_ids] if joint_ids else gains
 
-        if hasattr(data, "default_joint_damping") and data.default_joint_damping is not None:
-            gains = data.default_joint_damping
-            static_values[f"{term_name}_kd_gains"] = gains[:, joint_ids] if joint_ids else gains
+# ══════════════════════════════════════════════════════════════════
+# Helpers
+# ══════════════════════════════════════════════════════════════════
 
-    def _restore_action_manager(self):
-        """Restore original action manager methods."""
-        if self._original_process_action:
-            self.env.env.unwrapped.action_manager.process_action = self._original_process_action
-        if self._original_apply_action:
-            self.env.env.unwrapped.action_manager.apply_action = self._original_apply_action
 
-    # ──────────────────────────────────────────────────────────────────
-    # Action Write Annotations
-    # ──────────────────────────────────────────────────────────────────
+class _JointNameContext:
+    """Lightweight stand-in for resolving runtime joint name subsets in ``resolve_leapp_element_names``."""
 
-    def _prepare_action_write_annotations(self):
-        """Prepare annotating versions of low-level action writer methods."""
-        for method_name in self._get_semantic_action_write_methods():
-            original_method = getattr(Articulation, method_name, None)
-            if original_method is None:
-                continue
+    __slots__ = ("joint_names", "_joint_ids")
 
-            self._action_write_originals[method_name] = original_method
-            self._action_write_annotating[method_name] = self._make_annotating_action_write_method(
-                original_method, method_name
-            )
+    def __init__(self, joint_names: list[str], joint_ids):
+        self.joint_names = joint_names
+        self._joint_ids = joint_ids
 
-    def _make_annotating_action_write_method(self, original_func, method_name: str):
-        """Create an annotating version of a low-level action writer."""
-        signature = inspect.signature(original_func)
 
-        def annotating_method(asset_self, *args, **kwargs):
-            result = original_func(asset_self, *args, **kwargs)
-            bound_args = signature.bind_partial(asset_self, *args, **kwargs)
-            target = bound_args.arguments.get("target")
+def _unique_output_name(term_name: str, method_name: str, output_cache: list[TensorSemantics]) -> str:
+    """Return a stable, unique output name for an action write entry.
 
-            if not isinstance(target, torch.Tensor):
-                return result
+    Prefers ``term_name``, falls back to ``term_name_method_name``, and appends a
+    numeric suffix if even that collides.
+    """
+    existing = {t.name for t in output_cache}
+    candidate = term_name
+    if candidate in existing:
+        candidate = f"{term_name}_{method_name}"
+    suffix = 2
+    while candidate in existing:
+        candidate = f"{term_name}_{method_name}_{suffix}"
+        suffix += 1
+    return candidate
 
-            output_name = self._get_action_output_name(method_name)
-            semantics = getattr(self._action_write_originals[method_name], "_leapp_semantics", None)
-            joint_ids = bound_args.arguments.get("joint_ids")
-            tensor_target: torch.Tensor = target
-            target_snapshot = tensor_target.clone()
-            self._action_output_cache.append(
-                TensorSemantics(
-                    name=output_name,
-                    ref=target_snapshot,
-                    kind=semantics.kind if semantics is not None else None,
-                    element_names=resolve_leapp_element_names(
-                        semantics, self._make_joint_name_context(asset_self, joint_ids)
-                    ),
-                )
-            )
 
-            return result
+# ══════════════════════════════════════════════════════════════════
+# Public entry point
+# ══════════════════════════════════════════════════════════════════
 
-        annotating_method.__name__ = original_func.__name__
-        return annotating_method
 
-    def _apply_action_write_annotations(self):
-        """Temporarily apply annotating action writer methods."""
-        if not self._action_write_annotations_active:
-            for method_name, method in self._action_write_annotating.items():
-                setattr(Articulation, method_name, method)
-            self._action_write_annotations_active = True
+def patch_env_for_export(env: ManagerBasedEnv, task_name: str) -> None:
+    """Patch the env's observation and action managers for LEAPP export.
 
-    def _remove_action_write_annotations(self):
-        """Restore original low-level action writer methods."""
-        if self._action_write_annotations_active:
-            for method_name, method in self._action_write_originals.items():
-                setattr(Articulation, method_name, method)
-            self._action_write_annotations_active = False
+    This is a thin public entry point around ``ObservationPatcher`` and
+    ``ActionPatcher``. It mutates the provided env instance in-place so that:
 
-    # ──────────────────────────────────────────────────────────────────
-    # Helpers
-    # ──────────────────────────────────────────────────────────────────
+    - Observation terms route through proxy objects that annotate
+      ``ArticulationData`` reads.
+    - Action terms route through proxy objects that annotate
+      ``Articulation`` write methods.
 
-    def _get_semantic_action_write_methods(self) -> frozenset[str]:
-        """Collect Articulation methods that advertise LEAPP semantics."""
-        methods = set()
-        for method_name in dir(Articulation):
-            method = getattr(Articulation, method_name, None)
-            if callable(method) and hasattr(method, "_leapp_semantics"):
-                methods.add(method_name)
-        return frozenset(methods)
+    The underlying env, scene, assets, and tensors remain shared with the rest
+    of the pipeline; only the manager call paths are redirected.
+    """
+    unwrapped = env.env.unwrapped
 
-    def _get_action_output_name(self, method_name: str) -> str:
-        """Return a stable output name for the current action write."""
-        base_name = self._active_action_term_name or method_name
-        output_name = base_name
-        existing_names = {tensor.name for tensor in self._action_output_cache}
-        if output_name in existing_names:
-            output_name = f"{base_name}_{method_name}"
-        suffix = 2
-        while output_name in existing_names:
-            output_name = f"{base_name}_{method_name}_{suffix}"
-            suffix += 1
-        return output_name
+    obs_patcher = ObservationPatcher(task_name)
+    obs_patcher.setup(unwrapped.observation_manager)
 
-    def _make_joint_name_context(self, asset_self: Articulation, joint_ids):
-        """Create a lightweight context for resolving runtime joint name subsets."""
-        return type(
-            "JointNameContext",
-            (),
-            {"joint_names": asset_self.joint_names, "_joint_ids": joint_ids},
-        )()
-
-    def _get_semantic_articulation_properties(self) -> frozenset[str]:
-        """Collect ArticulationData properties that advertise LEAPP semantics."""
-        properties = set()
-        for prop_name in dir(ArticulationData):
-            prop = getattr(ArticulationData, prop_name, None)
-            if isinstance(prop, property) and prop.fget is not None and hasattr(prop.fget, "_leapp_semantics"):
-                properties.add(prop_name)
-        return frozenset(properties)
-
-    def _make_property_semantics(
-        self, prop_name: str, data_self: ArticulationData, tensor: torch.Tensor
-    ) -> TensorSemantics:
-        """Create semantic metadata for raw ArticulationData inputs."""
-        semantics = getattr(self._articulation_originals[prop_name].fget, "_leapp_semantics", None)
-        return TensorSemantics(
-            name=prop_name,
-            ref=tensor,
-            kind=semantics.kind if semantics is not None else None,
-            element_names=resolve_leapp_element_names(semantics, data_self),
-        )
+    action_patcher = ActionPatcher(task_name)
+    action_patcher.setup(unwrapped.action_manager)

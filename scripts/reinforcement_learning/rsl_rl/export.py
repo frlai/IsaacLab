@@ -60,7 +60,7 @@ import os
 import time
 import torch
 
-from export_annotator import ExportAnnotator
+from export_annotator import patch_env_for_export
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 
 from isaaclab.envs import (
@@ -126,8 +126,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # create isaac environment
     # Note: observation functions are already patched at module level (before isaaclab_tasks import)
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
-    annotator = ExportAnnotator(env, task_name=task_name)
-    annotator.setup()
+    patch_env_for_export(env, task_name=task_name)
 
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv):
