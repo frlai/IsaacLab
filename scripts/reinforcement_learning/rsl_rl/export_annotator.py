@@ -5,15 +5,30 @@
 
 """Export annotations for Isaac Lab policies using proxy-based patching.
 
-Observation and action annotation is achieved by routing calls through lightweight
-proxy objects rather than globally patching class methods. This means:
+Observation and action annotation share a single set of annotating getters
+and a unified dedup cache so that a state property (e.g. ``joint_pos``)
+read by both an observation term and an action term resolves to one LEAPP
+input edge.
 
-- Observation term functions see an _EnvProxy whose scene returns _ArticulationProxy
-  objects with annotating data getters. The real env / data is shared and unmodified.
+- Observation term functions see an _EnvProxy whose scene returns
+  _ArticulationProxy objects with annotating data getters.
 
-- Action terms have their ``_asset`` attribute replaced with an _ArticulationWriteProxy
-  that intercepts ``_leapp_semantics``-decorated write methods and records outputs.
-  The real Articulation class is never patched.
+- Action terms have their ``_asset`` attribute replaced with an
+  _ArticulationWriteProxy that intercepts ``_leapp_semantics``-decorated
+  write methods **and** routes ``.data`` reads through the same annotating
+  data proxy used by observations.
+
+Cache lifecycle (assuming single-env play-mode export):
+
+    compute_group()          clear cache → obs terms populate cache
+    policy inference         TracedTensors propagate through NN
+    process_action()         register_buffer for raw_actions
+    apply_action() [tracing] reuse cached TracedTensors for state reads,
+                             capture write outputs, call output_tensors(),
+                             then clear cache
+    apply_action() [decim.]  clear cache → fresh reads for simulation
+    ...
+    compute_group()          clear cache → fresh reads for next obs
 """
 
 from __future__ import annotations
@@ -35,7 +50,7 @@ if TYPE_CHECKING:
 
 
 # ══════════════════════════════════════════════════════════════════
-# Observation-side proxies
+# Shared data proxy
 # ══════════════════════════════════════════════════════════════════
 
 
@@ -44,7 +59,8 @@ class _ArticulationDataProxy:
 
     For properties whose getter carries ``_leapp_semantics``, the proxy calls
     the annotating getter (which records the tensor with LEAPP) and caches the
-    result for deduplication within a single ``compute_group`` call.
+    result for deduplication.  Consumers within the same annotation pass
+    (observation terms **and** action terms) receive the same TracedTensor.
 
     All other attribute access is forwarded transparently to the real object.
     """
@@ -66,6 +82,11 @@ class _ArticulationDataProxy:
             cache[name] = result
             return result
         return getattr(object.__getattribute__(self, "_real_data"), name)
+
+
+# ══════════════════════════════════════════════════════════════════
+# Observation-side proxies
+# ══════════════════════════════════════════════════════════════════
 
 
 class _ArticulationProxy:
@@ -150,14 +171,13 @@ class _EnvProxy:
 
 
 class _ArticulationWriteProxy:
-    """Proxy around a real Articulation that intercepts ``_leapp_semantics`` write methods.
+    """Proxy around a real Articulation for action terms.
 
-    When an action term calls e.g. ``self._asset.set_joint_position_target(target, joint_ids)``,
-    this proxy:
-
-    1. Calls the real method on the real asset (so the simulation sees the write).
-    2. Snapshots the ``target`` tensor and records a ``TensorSemantics`` entry in the
-       shared output cache.
+    Intercepts ``_leapp_semantics``-decorated write methods **and** routes
+    ``.data`` reads through a shared ``_ArticulationDataProxy`` so that
+    action-side state reads (e.g. ``self._asset.data.joint_pos`` inside
+    ``RelativeJointPositionAction``) participate in LEAPP annotation and
+    share the dedup cache with observation-side reads.
 
     All other attribute access is forwarded transparently to the real asset.
     """
@@ -168,11 +188,18 @@ class _ArticulationWriteProxy:
         term_name: str,
         output_cache: list[TensorSemantics],
         annotating_methods: dict[str, callable],
+        data_proxy: _ArticulationDataProxy,
     ):
         object.__setattr__(self, "_real_asset", real_asset)
         object.__setattr__(self, "_term_name", term_name)
         object.__setattr__(self, "_output_cache", output_cache)
         object.__setattr__(self, "_annotating_methods", annotating_methods)
+        object.__setattr__(self, "_data_proxy", data_proxy)
+
+    @property
+    def data(self):
+        """Return the shared annotating data proxy."""
+        return object.__getattribute__(self, "_data_proxy")
 
     def __getattr__(self, name):
         """Return an annotating wrapper for _leapp_semantics methods; forward everything else."""
@@ -187,62 +214,54 @@ class _ArticulationWriteProxy:
 
 
 # ══════════════════════════════════════════════════════════════════
-# ObservationPatcher
+# ExportPatcher
 # ══════════════════════════════════════════════════════════════════
 
 
-class ObservationPatcher:
-    """Permanently patches observation term functions to annotate their inputs via proxies.
+class ExportPatcher:
+    """Unified patcher that annotates observation inputs and action outputs for LEAPP export.
 
-    Instead of globally patching ArticulationData properties and toggling them on/off,
-    this scans for ``_leapp_semantics``-decorated properties once, builds annotating
-    getters, and routes observation term calls through lightweight proxy objects that
-    share the same underlying env and tensor state.
+    Builds a single set of annotating getters from ``ArticulationData`` and a
+    shared dedup cache, then wires them into both:
+
+    - The observation proxy chain (``_EnvProxy`` → ``_SceneProxy`` →
+      ``_ArticulationProxy`` → ``_ArticulationDataProxy``) for state reads
+      by observation term functions.
+    - The ``_ArticulationWriteProxy`` on each action term, which intercepts
+      target writes **and** routes ``.data`` reads through the same
+      ``_ArticulationDataProxy`` / cache.
+
+    This ensures that a property like ``joint_pos`` read by both an
+    observation term and ``RelativeJointPositionAction.apply_actions()``
+    resolves to a single LEAPP input edge rather than being silently baked
+    in as a constant.
     """
 
     def __init__(self, task_name: str):
         self.task_name = task_name
         self._annotated_tensor_cache: dict[str, torch.Tensor] = {}
+        self._action_output_cache: list[TensorSemantics] = []
+        self._pending_action_output_export: bool = False
+        self._uses_last_action_state: bool = False
 
-    def setup(self, obs_manager):
-        """Patch all observation terms to use annotating proxies.
-
-        For each term in the observation manager:
-        - Normal terms get their ``env`` argument swapped for a proxy env.
-        - ``last_action`` and ``generated_commands`` get dedicated wrappers.
-        - Noise is disabled on every term for deterministic export.
-
-        A thin wrapper on ``compute_group`` clears the dedup cache between calls.
-        """
-        real_env = obs_manager._env
+    def setup(self, env):
+        """Patch observation and action managers on the unwrapped env."""
+        unwrapped = env.env.unwrapped
 
         annotating_getters = self._build_annotating_getters()
-        scene_proxy = _SceneProxy(real_env.scene, annotating_getters, self._annotated_tensor_cache)
-        proxy_env = _EnvProxy(real_env, scene_proxy)
-
-        for group_name, term_cfgs in obs_manager._group_obs_term_cfgs.items():
-            for term_cfg in term_cfgs:
-                original_func = term_cfg.func
-                func_name = getattr(original_func, "__name__", None)
-
-                if func_name == "last_action":
-                    term_cfg.func = self._wrap_last_action(original_func)
-                elif func_name == "generated_commands":
-                    term_cfg.func = self._wrap_generated_commands(original_func, term_cfg)
-                else:
-                    term_cfg.func = self._wrap_with_proxy(original_func, proxy_env)
-
-                term_cfg.noise = None
-
-        original_compute_group = obs_manager.compute_group
+        annotating_write_methods = self._build_annotating_write_methods()
         cache = self._annotated_tensor_cache
 
-        def patched_compute_group(*args, **kwargs):
-            """Clear the tensor dedup cache, then run the real compute_group."""
-            cache.clear()
-            return original_compute_group(*args, **kwargs)
+        scene_proxy = _SceneProxy(unwrapped.scene, annotating_getters, cache)
+        proxy_env = _EnvProxy(unwrapped, scene_proxy)
 
-        obs_manager.compute_group = patched_compute_group
+        self._patch_observation_manager(unwrapped.observation_manager, proxy_env)
+        self._patch_action_manager(
+            unwrapped.action_manager,
+            annotating_getters,
+            cache,
+            annotating_write_methods,
+        )
 
     # ── Scanning ──────────────────────────────────────────────────
 
@@ -281,110 +300,10 @@ class ObservationPatcher:
 
         return getter
 
-    # ── Term wrappers ─────────────────────────────────────────────
-
-    @staticmethod
-    def _wrap_with_proxy(original_func, proxy_env):
-        """Wrap a term function so it receives the proxy env instead of the real env.
-
-        This is the generic wrapper for observation terms that read ArticulationData
-        properties. By substituting the env, the entire downstream chain
-        (env.scene[name].data.property) goes through the proxy.
-        """
-
-        def wrapped(env, **kwargs):
-            return original_func(proxy_env, **kwargs)
-
-        wrapped.__name__ = getattr(original_func, "__name__", "unknown")
-        return wrapped
-
-    def _wrap_last_action(self, original_func):
-        """Wrap the ``last_action`` observation term to annotate its output as a LEAPP input."""
-        task_name = self.task_name
-
-        def wrapped(env, action_name=None, **kwargs):
-            result = original_func(env, action_name, **kwargs)
-            return annotate.input_tensors(task_name, {"last_actions": result})
-
-        wrapped.__name__ = original_func.__name__
-        return wrapped
-
-    def _wrap_generated_commands(self, original_func, term_cfg):
-        """Wrap the ``generated_commands`` observation term to annotate its output as a LEAPP input.
-
-        Resolves command semantics (kind, element_names) from the command manager
-        configuration when available.
-        """
-        task_name = self.task_name
-        command_name_from_cfg = term_cfg.params.get("command_name")
-
-        def wrapped(env, command_name=None, **kwargs):
-            result = original_func(env, command_name, **kwargs)
-            leapp_input_name = command_name or command_name_from_cfg or "commands"
-            command_cfg = None
-            with suppress(AttributeError, KeyError):
-                command_cfg = env.command_manager.get_term(leapp_input_name).cfg
-            sem = TensorSemantics(
-                name=leapp_input_name,
-                ref=result,
-                kind=getattr(command_cfg, "cmd_hint", None),
-                element_names=getattr(command_cfg, "element_names", None),
-            )
-            return annotate.input_tensors(task_name, sem)
-
-        wrapped.__name__ = original_func.__name__
-        return wrapped
-
-
-# ══════════════════════════════════════════════════════════════════
-# ActionPatcher
-# ══════════════════════════════════════════════════════════════════
-
-
-class ActionPatcher:
-    """Permanently patches action terms to annotate their outputs via proxies.
-
-    1. Scans Articulation for ``_leapp_semantics``-decorated methods once.
-    2. Replaces each action term's ``_asset`` with an ``_ArticulationWriteProxy`` that
-       intercepts those methods and records output semantics.
-    3. Patches ``process_action`` and ``apply_action`` on the action manager instance
-       to coordinate buffer registration and the single ``annotate.output_tensors`` call.
-
-    No Articulation class methods are ever modified.
-    """
-
-    def __init__(self, task_name: str):
-        self.task_name = task_name
-        self._action_output_cache: list[TensorSemantics] = []
-        self._pending_action_output_export: bool = False
-
-    def setup(self, action_manager):
-        """Patch all action terms and the action manager for LEAPP annotation.
-
-        For each action term with an Articulation asset, replaces ``term._asset``
-        with an ``_ArticulationWriteProxy``. Then patches ``process_action`` and
-        ``apply_action`` on the manager instance.
-        """
-        annotating_methods = self._build_annotating_write_methods()
-
-        for term_name, term in action_manager._terms.items():
-            asset = getattr(term, "_asset", None)
-            if isinstance(asset, Articulation):
-                term._asset = _ArticulationWriteProxy(
-                    real_asset=asset,
-                    term_name=term_name,
-                    output_cache=self._action_output_cache,
-                    annotating_methods=annotating_methods,
-                )
-
-        self._patch_manager_methods(action_manager)
-
-    # ── Scanning ──────────────────────────────────────────────────
-
     def _build_annotating_write_methods(self) -> dict[str, callable]:
         """Scan Articulation for ``_leapp_semantics`` methods and build interceptors.
 
-        Returns a dict mapping method name to a factory callable. The factory takes
+        Returns a dict mapping method name to a factory callable.  The factory takes
         ``(real_asset, original_bound_method, term_name, output_cache)`` and returns
         a callable that the proxy returns in ``__getattr__``.
         """
@@ -399,7 +318,7 @@ class ActionPatcher:
         """Create a factory that produces bound annotating wrappers for a single write method.
 
         The factory is called by ``_ArticulationWriteProxy.__getattr__`` each time the
-        method is accessed. It returns a callable that:
+        method is accessed.  It returns a callable that:
 
         1. Calls the real method on the real asset.
         2. Inspects the ``target`` argument.
@@ -437,20 +356,77 @@ class ActionPatcher:
 
         return factory
 
-    # ── Manager patches ───────────────────────────────────────────
+    # ── Observation manager patches ───────────────────────────────
 
-    def _patch_manager_methods(self, action_manager):
+    def _patch_observation_manager(self, obs_manager, proxy_env):
+        """Patch observation terms to use annotating proxies and disable noise."""
+        for group_name, term_cfgs in obs_manager._group_obs_term_cfgs.items():
+            for term_cfg in term_cfgs:
+                original_func = term_cfg.func
+                func_name = getattr(original_func, "__name__", None)
+
+                if func_name == "last_action":
+                    self._uses_last_action_state = True
+                    term_cfg.func = self._wrap_last_action(original_func)
+                elif func_name == "generated_commands":
+                    term_cfg.func = self._wrap_generated_commands(original_func, term_cfg)
+                else:
+                    term_cfg.func = self._wrap_with_proxy(original_func, proxy_env)
+
+                term_cfg.noise = None
+
+        original_compute_group = obs_manager.compute_group
+        cache = self._annotated_tensor_cache
+
+        def patched_compute_group(*args, **kwargs):
+            """Clear the tensor dedup cache, then run the real compute_group."""
+            cache.clear()
+            return original_compute_group(*args, **kwargs)
+
+        obs_manager.compute_group = patched_compute_group
+
+    # ── Action manager patches ────────────────────────────────────
+
+    def _patch_action_manager(self, action_manager, annotating_getters, cache, annotating_write_methods):
+        """Patch action terms with write+read proxies and patch manager methods."""
+        for term_name, term in action_manager._terms.items():
+            asset = getattr(term, "_asset", None)
+            if isinstance(asset, Articulation):
+                data_proxy = _ArticulationDataProxy(asset.data, annotating_getters, cache)
+                term._asset = _ArticulationWriteProxy(
+                    real_asset=asset,
+                    term_name=term_name,
+                    output_cache=self._action_output_cache,
+                    annotating_methods=annotating_write_methods,
+                    data_proxy=data_proxy,
+                )
+
+        self._patch_action_manager_methods(action_manager)
+
+    def _patch_action_manager_methods(self, action_manager):
         """Patch ``process_action`` and ``apply_action`` on the action manager instance.
 
         ``process_action`` registers raw_action buffers for LEAPP tracing and
         preserves the action tensor clone.
 
-        ``apply_action`` coordinates the output cache lifecycle: clear before,
-        collect and export after.
+        ``apply_action`` coordinates the cache and output lifecycle:
+
+        - **Tracing pass** (first ``apply_action`` after ``process_action``):
+          The cache still holds TracedTensors populated by ``compute_group``.
+          Action terms that read state (e.g. ``RelativeJointPositionAction``
+          reading ``joint_pos``) get those TracedTensors from the cache,
+          keeping the LEAPP graph connected.  After ``output_tensors()`` the
+          cache is cleared so subsequent decimation sub-steps read fresh values.
+
+        - **Non-tracing passes** (remaining decimation sub-steps and all
+          subsequent iterations): The cache is cleared **before** running
+          action terms so every ``.data`` read returns the current simulator
+          value, preserving simulation correctness.
         """
         original_process = action_manager.process_action
         original_apply = action_manager.apply_action
         task_name = self.task_name
+        cache = self._annotated_tensor_cache
 
         def patched_process_action(action: torch.Tensor):
             """Register raw_action buffers, call real process_action, preserve action clone."""
@@ -463,15 +439,18 @@ class ActionPatcher:
             self._pending_action_output_export = True
 
         def patched_apply_action():
-            """Clear cache, call real apply_action, collect outputs, call annotate.output_tensors."""
+            """Coordinate cache lifecycle and LEAPP output annotation."""
             if not self._pending_action_output_export:
+                cache.clear()
                 return original_apply()
 
+            # Tracing pass: cache still holds TracedTensors from compute_group.
             self._action_output_cache.clear()
             original_apply()
 
             self._action_output_cache.extend(self._collect_action_outputs(action_manager))
-            self._action_output_cache.append(TensorSemantics(name="last_action", ref=action_manager._action))
+            if self._uses_last_action_state:
+                annotate.update_state(task_name, {"last_action": action_manager._action})
             static_values = self._collect_action_static_outputs(action_manager)
             annotate.output_tensors(
                 task_name,
@@ -481,10 +460,66 @@ class ActionPatcher:
             )
             self._pending_action_output_export = False
             self._action_output_cache.clear()
+            cache.clear()
             return None
 
         action_manager.process_action = patched_process_action
         action_manager.apply_action = patched_apply_action
+
+    # ── Observation term wrappers ─────────────────────────────────
+
+    @staticmethod
+    def _wrap_with_proxy(original_func, proxy_env):
+        """Wrap a term function so it receives the proxy env instead of the real env."""
+
+        def wrapped(env, **kwargs):
+            return original_func(proxy_env, **kwargs)
+
+        wrapped.__name__ = getattr(original_func, "__name__", "unknown")
+        return wrapped
+
+    def _wrap_last_action(self, original_func):
+        """Wrap ``last_action`` as a LEAPP state tensor.
+
+        ``last_action`` is feedback state, not a regular dangling input.  We
+        therefore register it through ``annotate.state_tensors(...)`` on the
+        observation side and update it through ``annotate.update_state(...)``
+        after the traced action pass.
+        """
+        task_name = self.task_name
+
+        def wrapped(env, action_name=None, **kwargs):
+            result = original_func(env, action_name, **kwargs)
+            return annotate.state_tensors(task_name, {"last_action": result})
+
+        wrapped.__name__ = original_func.__name__
+        return wrapped
+
+    def _wrap_generated_commands(self, original_func, term_cfg):
+        """Wrap the ``generated_commands`` observation term to annotate its output as a LEAPP input.
+
+        Resolves command semantics (kind, element_names) from the command manager
+        configuration when available.
+        """
+        task_name = self.task_name
+        command_name_from_cfg = term_cfg.params.get("command_name")
+
+        def wrapped(env, command_name=None, **kwargs):
+            result = original_func(env, command_name, **kwargs)
+            leapp_input_name = command_name or command_name_from_cfg or "commands"
+            command_cfg = None
+            with suppress(AttributeError, KeyError):
+                command_cfg = env.command_manager.get_term(leapp_input_name).cfg
+            sem = TensorSemantics(
+                name=leapp_input_name,
+                ref=result,
+                kind=getattr(command_cfg, "cmd_hint", None),
+                element_names=getattr(command_cfg, "element_names", None),
+            )
+            return annotate.input_tensors(task_name, sem)
+
+        wrapped.__name__ = original_func.__name__
+        return wrapped
 
     # ── Output collection ─────────────────────────────────────────
 
@@ -573,21 +608,21 @@ def _unique_output_name(term_name: str, method_name: str, output_cache: list[Ten
 def patch_env_for_export(env: ManagerBasedEnv, task_name: str) -> None:
     """Patch the env's observation and action managers for LEAPP export.
 
-    This is a thin public entry point around ``ObservationPatcher`` and
-    ``ActionPatcher``. It mutates the provided env instance in-place so that:
+    This is a thin public entry point around ``ExportPatcher``.  It mutates
+    the provided env instance in-place so that:
 
     - Observation terms route through proxy objects that annotate
       ``ArticulationData`` reads.
-    - Action terms route through proxy objects that annotate
-      ``Articulation`` write methods.
+    - Action terms route through proxy objects that annotate both
+      ``ArticulationData`` reads **and** ``Articulation`` write methods.
+
+    State reads are deduplicated across observation and action paths via a
+    shared cache, so a property like ``joint_pos`` that is read by both an
+    observation term and a relative-position action term appears as a single
+    LEAPP input edge.
 
     The underlying env, scene, assets, and tensors remain shared with the rest
     of the pipeline; only the manager call paths are redirected.
     """
-    unwrapped = env.env.unwrapped
-
-    obs_patcher = ObservationPatcher(task_name)
-    obs_patcher.setup(unwrapped.observation_manager)
-
-    action_patcher = ActionPatcher(task_name)
-    action_patcher.setup(unwrapped.action_manager)
+    patcher = ExportPatcher(task_name)
+    patcher.setup(env)

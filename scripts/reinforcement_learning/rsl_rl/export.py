@@ -72,20 +72,12 @@ from isaaclab.envs import (
 )
 from isaaclab.utils.assets import retrieve_file_path
 
-from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper, export_policy_as_jit, export_policy_as_onnx
+from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
 from isaaclab_rl.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
 
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
-
-# IMPORTANT: Add leapp annotations BEFORE importing isaaclab_tasks
-# This ensures the patched functions are captured when configs are created
-# from annotate_functions_for_export import (
-#     add_leapp_annotations,
-#     get_action_io_to_term_map,
-#     get_observation_to_articulation_map,
-# )
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -148,34 +140,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # obtain the trained policy for inference
     policy = runner.get_inference_policy(device=env.unwrapped.device)
 
-    # extract the neural network module
-    # we do this in a try-except to maintain backwards compatibility.
-    try:
-        # version 2.3 onwards
-        policy_nn = runner.alg.policy
-    except AttributeError:
-        # version 2.2 and below
-        policy_nn = runner.alg.actor_critic
-
-    # extract the normalizer
-    if hasattr(policy_nn, "actor_obs_normalizer"):
-        normalizer = policy_nn.actor_obs_normalizer
-    elif hasattr(policy_nn, "student_obs_normalizer"):
-        normalizer = policy_nn.student_obs_normalizer
-    else:
-        normalizer = None
-
-    # export policy to onnx/jit
-    export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
-    export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
-    export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
-    jit_path = os.path.join(export_model_dir, "policy.pt")
-    onnx_path = os.path.join(export_model_dir, "policy.onnx")
-    print(f"[INFO]: Exported policy to: jit {jit_path}, onnx {onnx_path}")
-
     # start annotation tracing
     # Note: all patching is done at module/class level before isaaclab_tasks import
-    leapp.start(task_name, save_path=export_model_dir)
+    leapp.start(task_name, save_path=log_dir)
     obs = env.get_observations()
     # simulate environment
     while not simulation_app.is_running():
