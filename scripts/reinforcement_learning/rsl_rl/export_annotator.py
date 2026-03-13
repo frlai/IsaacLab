@@ -49,6 +49,15 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
 
 
+# Reuse the generic joint-name resolver for kp/kd outputs by providing the
+# same ``element_names_source`` contract as articulation getters/writers.
+_GAIN_JOINT_SEMANTICS = type(
+    "GainJointSemantics",
+    (),
+    {"element_names": None, "element_names_source": "joint_names"},
+)()
+
+
 # ══════════════════════════════════════════════════════════════════
 # Shared data proxy
 # ══════════════════════════════════════════════════════════════════
@@ -392,9 +401,10 @@ class ExportPatcher:
         for term_name, term in action_manager._terms.items():
             asset = getattr(term, "_asset", None)
             if isinstance(asset, Articulation):
-                data_proxy = _ArticulationDataProxy(asset.data, annotating_getters, cache)
+                real_asset: Articulation = asset
+                data_proxy = _ArticulationDataProxy(real_asset.data, annotating_getters, cache)
                 term._asset = _ArticulationWriteProxy(
-                    real_asset=asset,
+                    real_asset=real_asset,
                     term_name=term_name,
                     output_cache=self._action_output_cache,
                     annotating_methods=annotating_write_methods,
@@ -530,26 +540,48 @@ class ExportPatcher:
         for term_name, term in action_manager._terms.items():
             osc = getattr(term, "_osc", None)
             if osc and hasattr(osc, "cfg") and osc.cfg.impedance_mode in ["variable", "variable_kp"]:
+                asset = getattr(term, "_asset", None)
+                real_asset = getattr(asset, "_real_asset", asset)
+                joint_ids = getattr(term, "_joint_ids", None)
+                joint_name_context = None
+                if real_asset is not None and hasattr(real_asset, "joint_names"):
+                    joint_name_context = _JointNameContext(real_asset.joint_names, joint_ids)
                 tensors.append(
                     TensorSemantics(
                         name=f"{term_name}_kp_gains",
                         ref=torch.diagonal(osc._motion_p_gains_task, dim1=-2, dim2=-1),
                         kind="kp",
+                        element_names=(
+                            resolve_leapp_element_names(
+                                _GAIN_JOINT_SEMANTICS,
+                                joint_name_context,
+                            )
+                            if joint_name_context is not None
+                            else None
+                        ),
                     )
                 )
                 tensors.append(
                     TensorSemantics(
                         name=f"{term_name}_kd_gains",
                         ref=torch.diagonal(osc._motion_d_gains_task, dim1=-2, dim2=-1),
-                        kind="kp",
+                        kind="kd",
+                        element_names=(
+                            resolve_leapp_element_names(
+                                _GAIN_JOINT_SEMANTICS,
+                                joint_name_context,
+                            )
+                            if joint_name_context is not None
+                            else None
+                        ),
                     )
                 )
         return tensors
 
     @staticmethod
-    def _collect_action_static_outputs(action_manager) -> dict:
+    def _collect_action_static_outputs(action_manager) -> list[TensorSemantics]:
         """Collect static kp/kd gain values from action terms for export metadata."""
-        static_values: dict = {}
+        static_values: list[TensorSemantics] = []
         for term_name, term in action_manager._terms.items():
             osc = getattr(term, "_osc", None)
             if osc and hasattr(osc, "cfg") and osc.cfg.impedance_mode in ["variable", "variable_kp"]:
@@ -559,12 +591,43 @@ class ExportPatcher:
             if real_asset and hasattr(real_asset, "data"):
                 data = real_asset.data
                 joint_ids = getattr(term, "_joint_ids", None)
+                joint_name_context = None
+                if hasattr(real_asset, "joint_names"):
+                    joint_name_context = _JointNameContext(real_asset.joint_names, joint_ids)
                 if hasattr(data, "default_joint_stiffness") and data.default_joint_stiffness is not None:
                     gains = data.default_joint_stiffness
-                    static_values[f"{term_name}_kp_gains"] = gains[:, joint_ids] if joint_ids else gains
+                    static_values.append(
+                        TensorSemantics(
+                            name=f"{term_name}_kp_gains",
+                            ref=gains[:, joint_ids] if joint_ids else gains,
+                            kind="kp",
+                            element_names=(
+                                resolve_leapp_element_names(
+                                    _GAIN_JOINT_SEMANTICS,
+                                    joint_name_context,
+                                )
+                                if joint_name_context is not None
+                                else None
+                            ),
+                        )
+                    )
                 if hasattr(data, "default_joint_damping") and data.default_joint_damping is not None:
                     gains = data.default_joint_damping
-                    static_values[f"{term_name}_kd_gains"] = gains[:, joint_ids] if joint_ids else gains
+                    static_values.append(
+                        TensorSemantics(
+                            name=f"{term_name}_kd_gains",
+                            ref=gains[:, joint_ids] if joint_ids else gains,
+                            kind="kd",
+                            element_names=(
+                                resolve_leapp_element_names(
+                                    _GAIN_JOINT_SEMANTICS,
+                                    joint_name_context,
+                                )
+                                if joint_name_context is not None
+                                else None
+                            ),
+                        )
+                    )
         return static_values
 
 
