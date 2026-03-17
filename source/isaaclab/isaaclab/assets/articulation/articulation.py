@@ -31,6 +31,8 @@ from .articulation_data import ArticulationData
 if TYPE_CHECKING:
     from .articulation_cfg import ArticulationCfg
 
+from isaaclab.utils.leapp_semantics import leapp_tensor_semantics
+
 # import logger
 logger = logging.getLogger(__name__)
 
@@ -1057,6 +1059,7 @@ class Articulation(AssetBase):
             if self.uses_external_wrench_positions:
                 self._external_wrench_positions_b.flatten(0, 1)[indices] = 0.0
 
+    @leapp_tensor_semantics(kind="target/joint/position", element_names_source="joint_names")
     def set_joint_position_target(
         self, target: torch.Tensor, joint_ids: Sequence[int] | slice | None = None, env_ids: Sequence[int] | None = None
     ):
@@ -1081,6 +1084,7 @@ class Articulation(AssetBase):
         # set targets
         self._data.joint_pos_target[env_ids, joint_ids] = target
 
+    @leapp_tensor_semantics(kind="target/joint/velocity", element_names_source="joint_names")
     def set_joint_velocity_target(
         self, target: torch.Tensor, joint_ids: Sequence[int] | slice | None = None, env_ids: Sequence[int] | None = None
     ):
@@ -1105,6 +1109,7 @@ class Articulation(AssetBase):
         # set targets
         self._data.joint_vel_target[env_ids, joint_ids] = target
 
+    @leapp_tensor_semantics(kind="target/joint/effort", element_names_source="joint_names")
     def set_joint_effort_target(
         self, target: torch.Tensor, joint_ids: Sequence[int] | slice | None = None, env_ids: Sequence[int] | None = None
     ):

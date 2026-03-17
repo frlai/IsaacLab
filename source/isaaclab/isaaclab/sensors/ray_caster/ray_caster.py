@@ -228,9 +228,9 @@ class RayCaster(SensorBase):
         self.drift = torch.zeros(self._view.count, 3, device=self.device)
         self.ray_cast_drift = torch.zeros(self._view.count, 3, device=self.device)
         # fill the data buffer
-        self._data.pos_w = torch.zeros(self._view.count, 3, device=self.device)
-        self._data.quat_w = torch.zeros(self._view.count, 4, device=self.device)
-        self._data.ray_hits_w = torch.zeros(self._view.count, self.num_rays, 3, device=self.device)
+        self._data._pos_w = torch.zeros(self._view.count, 3, device=self.device)
+        self._data._quat_w = torch.zeros(self._view.count, 4, device=self.device)
+        self._data._ray_hits_w = torch.zeros(self._view.count, self.num_rays, 3, device=self.device)
         self._ray_starts_w = torch.zeros(self._view.count, self.num_rays, 3, device=self.device)
         self._ray_directions_w = torch.zeros(self._view.count, self.num_rays, 3, device=self.device)
 
@@ -244,8 +244,8 @@ class RayCaster(SensorBase):
         # apply drift to ray starting position in world frame
         pos_w += self.drift[env_ids]
         # store the poses
-        self._data.pos_w[env_ids] = pos_w
-        self._data.quat_w[env_ids] = quat_w
+        self._data._pos_w[env_ids] = pos_w
+        self._data._quat_w[env_ids] = quat_w
 
         # check if user provided attach_yaw_only flag
         if self.cfg.attach_yaw_only is not None:
@@ -296,7 +296,7 @@ class RayCaster(SensorBase):
 
         # ray cast and store the hits
         # TODO: Make this work for multiple meshes?
-        self._data.ray_hits_w[env_ids] = raycast_mesh(
+        self._data._ray_hits_w[env_ids] = raycast_mesh(
             self._ray_starts_w[env_ids],
             self._ray_directions_w[env_ids],
             max_dist=self.cfg.max_distance,
@@ -304,7 +304,7 @@ class RayCaster(SensorBase):
         )[0]
 
         # apply vertical drift to ray starting position in ray caster frame
-        self._data.ray_hits_w[env_ids, :, 2] += self.ray_cast_drift[env_ids, 2].unsqueeze(-1)
+        self._data._ray_hits_w[env_ids, :, 2] += self.ray_cast_drift[env_ids, 2].unsqueeze(-1)
 
     def _set_debug_vis_impl(self, debug_vis: bool):
         # set visibility of markers

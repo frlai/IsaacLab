@@ -86,6 +86,9 @@ class UniformVelocityCommand(CommandTerm):
         self.metrics["error_vel_xy"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["error_vel_yaw"] = torch.zeros(self.num_envs, device=self.device)
 
+        self.cfg.cmd_hint = self.cfg.cmd_hint or "command/body/velocity"
+        self.cfg.element_names = self.cfg.element_names or ["lin_vel_x", "lin_vel_y", "ang_vel_z"]
+
     def __str__(self) -> str:
         """Return a string representation of the command generator."""
         msg = "UniformVelocityCommand:\n"

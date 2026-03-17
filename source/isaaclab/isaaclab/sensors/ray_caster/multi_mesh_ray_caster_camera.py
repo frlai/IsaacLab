@@ -105,8 +105,8 @@ class MultiMeshRayCasterCamera(RayCasterCamera, MultiMeshRayCaster):
         self._offset_quat = quat_w.repeat(self._view.count, 1)
         self._offset_pos = torch.tensor(list(self.cfg.offset.pos), device=self._device).repeat(self._view.count, 1)
 
-        self._data.quat_w = torch.zeros(self._view.count, 4, device=self.device)
-        self._data.pos_w = torch.zeros(self._view.count, 3, device=self.device)
+        self._data._quat_w = torch.zeros(self._view.count, 4, device=self.device)
+        self._data._pos_w = torch.zeros(self._view.count, 3, device=self.device)
 
         self._ray_starts_w = torch.zeros(self._view.count, self.num_rays, 3, device=self.device)
         self._ray_directions_w = torch.zeros(self._view.count, self.num_rays, 3, device=self.device)

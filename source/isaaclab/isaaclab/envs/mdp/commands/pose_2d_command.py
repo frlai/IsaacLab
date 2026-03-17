@@ -60,6 +60,9 @@ class UniformPose2dCommand(CommandTerm):
         self.metrics["error_pos"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["error_heading"] = torch.zeros(self.num_envs, device=self.device)
 
+        self.cfg.cmd_hint = self.cfg.cmd_hint or "command/body/pose"
+        self.cfg.element_names = self.cfg.element_names or ["x", "y", "z", "heading"]
+
     def __str__(self) -> str:
         msg = "PositionCommand:\n"
         msg += f"\tCommand dimension: {tuple(self.command.shape[1:])}\n"

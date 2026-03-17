@@ -353,13 +353,13 @@ class FrameTransformer(SensorBase):
             self._target_frame_offset_quat = torch.stack(target_frame_offset_quat).repeat(self._num_envs, 1)
 
         # fill the data buffer
-        self._data.target_frame_names = self._target_frame_names
-        self._data.source_pos_w = torch.zeros(self._num_envs, 3, device=self._device)
-        self._data.source_quat_w = torch.zeros(self._num_envs, 4, device=self._device)
-        self._data.target_pos_w = torch.zeros(self._num_envs, len(duplicate_frame_indices), 3, device=self._device)
-        self._data.target_quat_w = torch.zeros(self._num_envs, len(duplicate_frame_indices), 4, device=self._device)
-        self._data.target_pos_source = torch.zeros_like(self._data.target_pos_w)
-        self._data.target_quat_source = torch.zeros_like(self._data.target_quat_w)
+        self._data._target_frame_names = self._target_frame_names
+        self._data._source_pos_w = torch.zeros(self._num_envs, 3, device=self._device)
+        self._data._source_quat_w = torch.zeros(self._num_envs, 4, device=self._device)
+        self._data._target_pos_w = torch.zeros(self._num_envs, len(duplicate_frame_indices), 3, device=self._device)
+        self._data._target_quat_w = torch.zeros(self._num_envs, len(duplicate_frame_indices), 4, device=self._device)
+        self._data._target_pos_source = torch.zeros_like(self._data._target_pos_w)
+        self._data._target_quat_source = torch.zeros_like(self._data._target_quat_w)
 
     def _update_buffers_impl(self, env_ids: Sequence[int]):
         """Fills the buffers of the sensor data."""
@@ -419,12 +419,12 @@ class FrameTransformer(SensorBase):
 
         # Update buffers
         # note: The frame names / ordering don't change so no need to update them after initialization
-        self._data.source_pos_w[:] = source_pos_w.view(-1, 3)
-        self._data.source_quat_w[:] = source_quat_w.view(-1, 4)
-        self._data.target_pos_w[:] = target_pos_w.view(-1, total_num_frames, 3)
-        self._data.target_quat_w[:] = target_quat_w.view(-1, total_num_frames, 4)
-        self._data.target_pos_source[:] = target_pos_source.view(-1, total_num_frames, 3)
-        self._data.target_quat_source[:] = target_quat_source.view(-1, total_num_frames, 4)
+        self._data._source_pos_w[:] = source_pos_w.view(-1, 3)
+        self._data._source_quat_w[:] = source_quat_w.view(-1, 4)
+        self._data._target_pos_w[:] = target_pos_w.view(-1, total_num_frames, 3)
+        self._data._target_quat_w[:] = target_quat_w.view(-1, total_num_frames, 4)
+        self._data._target_pos_source[:] = target_pos_source.view(-1, total_num_frames, 3)
+        self._data._target_quat_source[:] = target_quat_source.view(-1, total_num_frames, 4)
 
     def _set_debug_vis_impl(self, debug_vis: bool):
         # set visibility of markers
