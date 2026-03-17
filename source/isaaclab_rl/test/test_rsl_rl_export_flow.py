@@ -129,10 +129,17 @@ def test_export_flow(task_name):
 
         # Surface stdout/stderr on failure for easier debugging
         if result.returncode != 0:
+            log_txt_path = os.path.join(export_dir, "log.txt")
+            leapp_tail = ""
+            if os.path.isfile(log_txt_path):
+                with open(log_txt_path) as f:
+                    last_lines = f.readlines()[-50:]
+                leapp_tail = f"\n--- leapp log.txt (last 50 lines) ---\n{''.join(last_lines)}"
             pytest.fail(
                 f"export.py exited with code {result.returncode}.\n"
                 f"--- stdout ---\n{result.stdout[-3000:]}\n"
                 f"--- stderr ---\n{result.stderr[-3000:]}"
+                f"{leapp_tail}"
             )
 
         assert os.path.isfile(os.path.join(export_dir, f"{task_name}.onnx")), "Missing .onnx export"

@@ -43,6 +43,7 @@ from leapp.utils.tensor_description import TensorSemantics
 
 from isaaclab.assets.articulation.articulation import Articulation
 from isaaclab.assets.articulation.articulation_data import ArticulationData
+from isaaclab.managers import ManagerTermBase
 from isaaclab.sensors.camera.camera_data import CameraData
 from isaaclab.sensors.contact_sensor.contact_sensor_data import ContactSensorData
 from isaaclab.sensors.frame_transformer.frame_transformer_data import FrameTransformerData
@@ -306,6 +307,46 @@ class _EnvProxy:
     def __getattr__(self, name):
         """Forward all non-scene attribute access to the real env."""
         return getattr(object.__getattribute__(self, "_real_env"), name)
+
+
+class _ManagerTermProxy(ManagerTermBase):
+    """Proxy a class-based manager term while preserving its lifecycle methods.
+
+    Observation manager terms can be stateful ``ManagerTermBase`` instances that
+    expose ``reset()`` and ``serialize()`` in addition to being callable. This
+    proxy preserves that interface while swapping the env argument passed into
+    ``__call__`` for the observation-side proxy env.
+    """
+
+    def __init__(self, target: ManagerTermBase, proxy_env: _EnvProxy):
+        super().__init__(target.cfg, target._env)
+        self._target = target
+        self._proxy_env = proxy_env
+
+    @property
+    def __name__(self) -> str:
+        """Expose the wrapped term name for compatibility and debugging."""
+        return getattr(self._target, "__name__", self._target.__class__.__name__)
+
+    def reset(self, env_ids=None) -> None:
+        """Forward resets to the wrapped term instance."""
+        self._target.reset(env_ids=env_ids)
+
+    def serialize(self) -> dict:
+        """Forward serialization to the wrapped term instance."""
+        return self._target.serialize()
+
+    def __call__(self, *args, **kwargs):
+        """Call the wrapped term with the proxy env in place of the real env."""
+        if args:
+            args = (self._proxy_env, *args[1:])
+        else:
+            args = (self._proxy_env,)
+        return self._target(*args, **kwargs)
+
+    def __getattr__(self, name):
+        """Forward all other attribute access to the wrapped term instance."""
+        return getattr(self._target, name)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -627,8 +668,15 @@ class ExportPatcher:
     def _wrap_with_proxy(original_func, proxy_env):
         """Wrap a term function so it receives the proxy env instead of the real env."""
 
-        def wrapped(env, **kwargs):
-            return original_func(proxy_env, **kwargs)
+        if isinstance(original_func, ManagerTermBase):
+            return _ManagerTermProxy(original_func, proxy_env)
+
+        def wrapped(*args, **kwargs):
+            if args:
+                args = (proxy_env, *args[1:])
+            else:
+                args = (proxy_env,)
+            return original_func(*args, **kwargs)
 
         wrapped.__name__ = getattr(original_func, "__name__", "unknown")
         return wrapped
