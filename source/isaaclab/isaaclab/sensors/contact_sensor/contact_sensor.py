@@ -147,24 +147,24 @@ class ContactSensor(SensorBase):
         if env_ids is None:
             env_ids = slice(None)
         # reset accumulative data buffers
-        self._data.net_forces_w[env_ids] = 0.0
-        self._data.net_forces_w_history[env_ids] = 0.0
+        self._data._net_forces_w[env_ids] = 0.0
+        self._data._net_forces_w_history[env_ids] = 0.0
         # reset force matrix
         if len(self.cfg.filter_prim_paths_expr) != 0:
-            self._data.force_matrix_w[env_ids] = 0.0
-            self._data.force_matrix_w_history[env_ids] = 0.0
+            self._data._force_matrix_w[env_ids] = 0.0
+            self._data._force_matrix_w_history[env_ids] = 0.0
         # reset the current air time
         if self.cfg.track_air_time:
-            self._data.current_air_time[env_ids] = 0.0
-            self._data.last_air_time[env_ids] = 0.0
-            self._data.current_contact_time[env_ids] = 0.0
-            self._data.last_contact_time[env_ids] = 0.0
+            self._data._current_air_time[env_ids] = 0.0
+            self._data._last_air_time[env_ids] = 0.0
+            self._data._current_contact_time[env_ids] = 0.0
+            self._data._last_contact_time[env_ids] = 0.0
         # reset contact positions
         if self.cfg.track_contact_points:
-            self._data.contact_pos_w[env_ids, :] = torch.nan
+            self._data._contact_pos_w[env_ids, :] = torch.nan
         # reset friction forces
         if self.cfg.track_friction_forces:
-            self._data.friction_forces_w[env_ids, :] = 0.0
+            self._data._friction_forces_w[env_ids, :] = 0.0
 
     def find_bodies(self, name_keys: str | Sequence[str], preserve_order: bool = False) -> tuple[list[int], list[str]]:
         """Find bodies in the articulation based on the name keys.
@@ -298,19 +298,20 @@ class ContactSensor(SensorBase):
             )
 
         # prepare data buffers
-        self._data.net_forces_w = torch.zeros(self._num_envs, self._num_bodies, 3, device=self._device)
+        self._data._body_names = list(self.body_names)
+        self._data._net_forces_w = torch.zeros(self._num_envs, self._num_bodies, 3, device=self._device)
         # optional buffers
         # -- history of net forces
         if self.cfg.history_length > 0:
-            self._data.net_forces_w_history = torch.zeros(
+            self._data._net_forces_w_history = torch.zeros(
                 self._num_envs, self.cfg.history_length, self._num_bodies, 3, device=self._device
             )
         else:
-            self._data.net_forces_w_history = self._data.net_forces_w.unsqueeze(1)
+            self._data._net_forces_w_history = self._data._net_forces_w.unsqueeze(1)
         # -- pose of sensor origins
         if self.cfg.track_pose:
-            self._data.pos_w = torch.zeros(self._num_envs, self._num_bodies, 3, device=self._device)
-            self._data.quat_w = torch.zeros(self._num_envs, self._num_bodies, 4, device=self._device)
+            self._data._pos_w = torch.zeros(self._num_envs, self._num_bodies, 3, device=self._device)
+            self._data._quat_w = torch.zeros(self._num_envs, self._num_bodies, 4, device=self._device)
 
         # check if filter paths are valid
         if self.cfg.track_contact_points or self.cfg.track_friction_forces:
@@ -328,37 +329,37 @@ class ContactSensor(SensorBase):
 
         # -- position of contact points
         if self.cfg.track_contact_points:
-            self._data.contact_pos_w = torch.full(
+            self._data._contact_pos_w = torch.full(
                 (self._num_envs, self._num_bodies, self.contact_physx_view.filter_count, 3),
                 torch.nan,
                 device=self._device,
             )
         # -- friction forces at contact points
         if self.cfg.track_friction_forces:
-            self._data.friction_forces_w = torch.full(
+            self._data._friction_forces_w = torch.full(
                 (self._num_envs, self._num_bodies, self.contact_physx_view.filter_count, 3),
                 0.0,
                 device=self._device,
             )
         # -- air/contact time between contacts
         if self.cfg.track_air_time:
-            self._data.last_air_time = torch.zeros(self._num_envs, self._num_bodies, device=self._device)
-            self._data.current_air_time = torch.zeros(self._num_envs, self._num_bodies, device=self._device)
-            self._data.last_contact_time = torch.zeros(self._num_envs, self._num_bodies, device=self._device)
-            self._data.current_contact_time = torch.zeros(self._num_envs, self._num_bodies, device=self._device)
+            self._data._last_air_time = torch.zeros(self._num_envs, self._num_bodies, device=self._device)
+            self._data._current_air_time = torch.zeros(self._num_envs, self._num_bodies, device=self._device)
+            self._data._last_contact_time = torch.zeros(self._num_envs, self._num_bodies, device=self._device)
+            self._data._current_contact_time = torch.zeros(self._num_envs, self._num_bodies, device=self._device)
         # force matrix: (num_envs, num_bodies, num_filter_shapes, 3)
         # force matrix history: (num_envs, history_length, num_bodies, num_filter_shapes, 3)
         if len(self.cfg.filter_prim_paths_expr) != 0:
             num_filters = self.contact_physx_view.filter_count
-            self._data.force_matrix_w = torch.zeros(
+            self._data._force_matrix_w = torch.zeros(
                 self._num_envs, self._num_bodies, num_filters, 3, device=self._device
             )
             if self.cfg.history_length > 0:
-                self._data.force_matrix_w_history = torch.zeros(
+                self._data._force_matrix_w_history = torch.zeros(
                     self._num_envs, self.cfg.history_length, self._num_bodies, num_filters, 3, device=self._device
                 )
             else:
-                self._data.force_matrix_w_history = self._data.force_matrix_w.unsqueeze(1)
+                self._data._force_matrix_w_history = self._data._force_matrix_w.unsqueeze(1)
 
     def _update_buffers_impl(self, env_ids: Sequence[int]):
         """Fills the buffers of the sensor data."""
@@ -370,11 +371,11 @@ class ContactSensor(SensorBase):
         # TODO: We are handling the indexing ourself because of the shape; (N, B) vs expected (N * B).
         #   This isn't the most efficient way to do this, but it's the easiest to implement.
         net_forces_w = self.contact_physx_view.get_net_contact_forces(dt=self._sim_physics_dt)
-        self._data.net_forces_w[env_ids, :, :] = net_forces_w.view(-1, self._num_bodies, 3)[env_ids]
+        self._data._net_forces_w[env_ids, :, :] = net_forces_w.view(-1, self._num_bodies, 3)[env_ids]
         # update contact force history
         if self.cfg.history_length > 0:
-            self._data.net_forces_w_history[env_ids] = self._data.net_forces_w_history[env_ids].roll(1, dims=1)
-            self._data.net_forces_w_history[env_ids, 0] = self._data.net_forces_w[env_ids]
+            self._data._net_forces_w_history[env_ids] = self._data._net_forces_w_history[env_ids].roll(1, dims=1)
+            self._data._net_forces_w_history[env_ids, 0] = self._data._net_forces_w[env_ids]
 
         # obtain the contact force matrix
         if len(self.cfg.filter_prim_paths_expr) != 0:
@@ -383,23 +384,25 @@ class ContactSensor(SensorBase):
             # acquire and shape the force matrix
             force_matrix_w = self.contact_physx_view.get_contact_force_matrix(dt=self._sim_physics_dt)
             force_matrix_w = force_matrix_w.view(-1, self._num_bodies, num_filters, 3)
-            self._data.force_matrix_w[env_ids] = force_matrix_w[env_ids]
+            self._data._force_matrix_w[env_ids] = force_matrix_w[env_ids]
             if self.cfg.history_length > 0:
-                self._data.force_matrix_w_history[env_ids] = self._data.force_matrix_w_history[env_ids].roll(1, dims=1)
-                self._data.force_matrix_w_history[env_ids, 0] = self._data.force_matrix_w[env_ids]
+                self._data._force_matrix_w_history[env_ids] = self._data._force_matrix_w_history[env_ids].roll(
+                    1, dims=1
+                )
+                self._data._force_matrix_w_history[env_ids, 0] = self._data._force_matrix_w[env_ids]
 
         # obtain the pose of the sensor origin
         if self.cfg.track_pose:
             pose = self.body_physx_view.get_transforms().view(-1, self._num_bodies, 7)[env_ids]
             pose[..., 3:] = convert_quat(pose[..., 3:], to="wxyz")
-            self._data.pos_w[env_ids], self._data.quat_w[env_ids] = pose.split([3, 4], dim=-1)
+            self._data._pos_w[env_ids], self._data._quat_w[env_ids] = pose.split([3, 4], dim=-1)
 
         # obtain contact points
         if self.cfg.track_contact_points:
             _, buffer_contact_points, _, _, buffer_count, buffer_start_indices = (
                 self.contact_physx_view.get_contact_data(dt=self._sim_physics_dt)
             )
-            self._data.contact_pos_w[env_ids] = self._unpack_contact_buffer_data(
+            self._data._contact_pos_w[env_ids] = self._unpack_contact_buffer_data(
                 buffer_contact_points, buffer_count, buffer_start_indices
             )[env_ids]
 
@@ -408,7 +411,7 @@ class ContactSensor(SensorBase):
             friction_forces, _, buffer_count, buffer_start_indices = self.contact_physx_view.get_friction_data(
                 dt=self._sim_physics_dt
             )
-            self._data.friction_forces_w[env_ids] = self._unpack_contact_buffer_data(
+            self._data._friction_forces_w[env_ids] = self._unpack_contact_buffer_data(
                 friction_forces, buffer_count, buffer_start_indices, avg=False, default=0.0
             )[env_ids]
 
@@ -418,28 +421,28 @@ class ContactSensor(SensorBase):
             # since this function is called every frame, we can use the difference to get the elapsed time
             elapsed_time = self._timestamp[env_ids] - self._timestamp_last_update[env_ids]
             # -- check contact state of bodies
-            is_contact = torch.norm(self._data.net_forces_w[env_ids, :, :], dim=-1) > self.cfg.force_threshold
-            is_first_contact = (self._data.current_air_time[env_ids] > 0) * is_contact
-            is_first_detached = (self._data.current_contact_time[env_ids] > 0) * ~is_contact
+            is_contact = torch.norm(self._data._net_forces_w[env_ids, :, :], dim=-1) > self.cfg.force_threshold
+            is_first_contact = (self._data._current_air_time[env_ids] > 0) * is_contact
+            is_first_detached = (self._data._current_contact_time[env_ids] > 0) * ~is_contact
             # -- update the last contact time if body has just become in contact
-            self._data.last_air_time[env_ids] = torch.where(
+            self._data._last_air_time[env_ids] = torch.where(
                 is_first_contact,
-                self._data.current_air_time[env_ids] + elapsed_time.unsqueeze(-1),
-                self._data.last_air_time[env_ids],
+                self._data._current_air_time[env_ids] + elapsed_time.unsqueeze(-1),
+                self._data._last_air_time[env_ids],
             )
             # -- increment time for bodies that are not in contact
-            self._data.current_air_time[env_ids] = torch.where(
-                ~is_contact, self._data.current_air_time[env_ids] + elapsed_time.unsqueeze(-1), 0.0
+            self._data._current_air_time[env_ids] = torch.where(
+                ~is_contact, self._data._current_air_time[env_ids] + elapsed_time.unsqueeze(-1), 0.0
             )
             # -- update the last contact time if body has just detached
-            self._data.last_contact_time[env_ids] = torch.where(
+            self._data._last_contact_time[env_ids] = torch.where(
                 is_first_detached,
-                self._data.current_contact_time[env_ids] + elapsed_time.unsqueeze(-1),
-                self._data.last_contact_time[env_ids],
+                self._data._current_contact_time[env_ids] + elapsed_time.unsqueeze(-1),
+                self._data._last_contact_time[env_ids],
             )
             # -- increment time for bodies that are in contact
-            self._data.current_contact_time[env_ids] = torch.where(
-                is_contact, self._data.current_contact_time[env_ids] + elapsed_time.unsqueeze(-1), 0.0
+            self._data._current_contact_time[env_ids] = torch.where(
+                is_contact, self._data._current_contact_time[env_ids] + elapsed_time.unsqueeze(-1), 0.0
             )
 
     def _unpack_contact_buffer_data(

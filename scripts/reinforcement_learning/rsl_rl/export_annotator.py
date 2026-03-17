@@ -36,13 +36,21 @@ from __future__ import annotations
 import inspect
 import torch
 from contextlib import suppress
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from leapp import annotate
 from leapp.utils.tensor_description import TensorSemantics
 
 from isaaclab.assets.articulation.articulation import Articulation
 from isaaclab.assets.articulation.articulation_data import ArticulationData
+from isaaclab.sensors.camera.camera_data import CameraData
+from isaaclab.sensors.contact_sensor.contact_sensor_data import ContactSensorData
+from isaaclab.sensors.frame_transformer.frame_transformer_data import FrameTransformerData
+from isaaclab.sensors.imu.imu_data import ImuData
+from isaaclab.sensors.ray_caster.multi_mesh_ray_caster_camera_data import MultiMeshRayCasterCameraData
+from isaaclab.sensors.ray_caster.multi_mesh_ray_caster_data import MultiMeshRayCasterData
+from isaaclab.sensors.ray_caster.ray_caster_data import RayCasterData
+from isaaclab.sensors.tacsl_sensor.visuotactile_sensor_data import VisuoTactileSensorData
 from isaaclab.utils.leapp_semantics import resolve_leapp_element_names
 
 if TYPE_CHECKING:
@@ -57,40 +65,81 @@ _GAIN_JOINT_SEMANTICS = type(
     {"element_names": None, "element_names_source": "joint_names"},
 )()
 
+_ANNOTATED_DATA_CLASSES = (
+    ArticulationData,
+    CameraData,
+    ContactSensorData,
+    FrameTransformerData,
+    ImuData,
+    MultiMeshRayCasterCameraData,
+    MultiMeshRayCasterData,
+    RayCasterData,
+    VisuoTactileSensorData,
+)
+
 
 # ══════════════════════════════════════════════════════════════════
 # Shared data proxy
 # ══════════════════════════════════════════════════════════════════
 
 
-class _ArticulationDataProxy:
-    """Proxy around a real ArticulationData that intercepts annotated property reads.
+def _lookup_annotating_getter(
+    annotating_getters_by_type: dict[type, dict[str, callable]], real_data: Any, name: str
+) -> callable | None:
+    """Return the annotating getter for a property on the given data object, if any."""
+    for data_cls in type(real_data).__mro__:
+        getter = annotating_getters_by_type.get(data_cls, {}).get(name)
+        if getter is not None:
+            return getter
+    return None
 
-    For properties whose getter carries ``_leapp_semantics``, the proxy calls
-    the annotating getter (which records the tensor with LEAPP) and caches the
-    result for deduplication.  Consumers within the same annotation pass
-    (observation terms **and** action terms) receive the same TracedTensor.
+
+def _has_annotated_getters(annotating_getters_by_type: dict[type, dict[str, callable]], real_data: Any) -> bool:
+    """Return True when the data object's class hierarchy exposes any annotated getters."""
+    return any(annotating_getters_by_type.get(data_cls) for data_cls in type(real_data).__mro__)
+
+
+class _DataProxy:
+    """Proxy around a real data object that intercepts annotated property reads.
+
+    The real data object may be an ``ArticulationData`` instance or any sensor
+    data class whose properties carry ``_leapp_semantics``. The proxy calls the
+    annotating getter (which records the tensor with LEAPP) and caches the
+    result for deduplication. Consumers within the same annotation pass
+    (observation terms **and** action terms) receive the same TracedTensor for
+    repeated reads from the same underlying data object.
 
     All other attribute access is forwarded transparently to the real object.
     """
 
-    def __init__(self, real_data: ArticulationData, annotating_getters: dict[str, callable], cache: dict):
+    def __init__(
+        self,
+        real_data: Any,
+        annotating_getters_by_type: dict[type, dict[str, callable]],
+        cache: dict,
+        input_name_resolver: callable,
+    ):
         object.__setattr__(self, "_real_data", real_data)
-        object.__setattr__(self, "_annotating_getters", annotating_getters)
+        object.__setattr__(self, "_annotating_getters_by_type", annotating_getters_by_type)
         object.__setattr__(self, "_cache", cache)
+        object.__setattr__(self, "_input_name_resolver", input_name_resolver)
 
     def __getattr__(self, name):
         """Intercept annotated properties; forward everything else."""
-        getters = object.__getattribute__(self, "_annotating_getters")
-        if name in getters:
+        real_data = object.__getattribute__(self, "_real_data")
+        getter = _lookup_annotating_getter(
+            object.__getattribute__(self, "_annotating_getters_by_type"), real_data, name
+        )
+        if getter is not None:
             cache = object.__getattribute__(self, "_cache")
-            if name in cache:
-                return cache[name].clone()
-            real_data = object.__getattribute__(self, "_real_data")
-            result = getters[name](real_data)
-            cache[name] = result
+            cache_key = (id(real_data), name)
+            if cache_key in cache:
+                return cache[cache_key].clone()
+            input_name = object.__getattribute__(self, "_input_name_resolver")(name)
+            result = getter(real_data, input_name)
+            cache[cache_key] = result
             return result
-        return getattr(object.__getattribute__(self, "_real_data"), name)
+        return getattr(real_data, name)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -98,55 +147,140 @@ class _ArticulationDataProxy:
 # ══════════════════════════════════════════════════════════════════
 
 
-class _ArticulationProxy:
-    """Proxy around a real Articulation that returns _ArticulationDataProxy for ``.data``.
+class _EntityProxy:
+    """Proxy around a real scene entity that returns a ``_DataProxy`` for ``.data``.
 
     All other attribute access is forwarded transparently to the real asset.
     """
 
-    def __init__(self, real_asset: Articulation, data_proxy: _ArticulationDataProxy):
-        object.__setattr__(self, "_real_asset", real_asset)
+    def __init__(self, real_entity: Any, data_proxy: _DataProxy):
+        object.__setattr__(self, "_real_entity", real_entity)
         object.__setattr__(self, "_data_proxy", data_proxy)
 
     @property
     def data(self):
-        """Return the annotating data proxy instead of the real ArticulationData."""
+        """Return the annotating data proxy instead of the real data object."""
         return object.__getattribute__(self, "_data_proxy")
 
     def __getattr__(self, name):
-        """Forward all non-data attribute access to the real asset."""
-        return getattr(object.__getattribute__(self, "_real_asset"), name)
+        """Forward all non-data attribute access to the real scene entity."""
+        return getattr(object.__getattribute__(self, "_real_entity"), name)
+
+
+class _EntityMappingProxy:
+    """Proxy around a mapping of scene entities that lazily wraps data-producing entries."""
+
+    def __init__(self, real_mapping, annotating_getters_by_type: dict[type, dict[str, callable]], cache: dict):
+        object.__setattr__(self, "_real_mapping", real_mapping)
+        object.__setattr__(self, "_annotating_getters_by_type", annotating_getters_by_type)
+        object.__setattr__(self, "_cache", cache)
+        object.__setattr__(self, "_proxied", {})
+
+    def __getitem__(self, key):
+        """Return a proxied entity when it exposes annotated data properties."""
+        proxied = object.__getattribute__(self, "_proxied")
+        if key in proxied:
+            return proxied[key]
+        real_mapping = object.__getattribute__(self, "_real_mapping")
+        entity = real_mapping[key]
+        data = getattr(entity, "data", None)
+        if data is None:
+            return entity
+        annotating_getters_by_type = object.__getattribute__(self, "_annotating_getters_by_type")
+        if not _has_annotated_getters(annotating_getters_by_type, data):
+            return entity
+        data_proxy = _DataProxy(
+            data,
+            annotating_getters_by_type,
+            object.__getattribute__(self, "_cache"),
+            input_name_resolver=lambda prop_name: f"{key}_{prop_name}",
+        )
+        proxy = _EntityProxy(entity, data_proxy)
+        proxied[key] = proxy
+        return proxy
+
+    def get(self, key, default=None):
+        """Return a proxied entity when present, default otherwise."""
+        real_mapping = object.__getattribute__(self, "_real_mapping")
+        if key not in real_mapping:
+            return default
+        return self[key]
+
+    def __iter__(self):
+        return iter(object.__getattribute__(self, "_real_mapping"))
+
+    def __len__(self):
+        return len(object.__getattribute__(self, "_real_mapping"))
+
+    def __getattr__(self, name):
+        """Forward all other mapping access to the real mapping."""
+        return getattr(object.__getattribute__(self, "_real_mapping"), name)
 
 
 class _SceneProxy:
     """Proxy around the real InteractiveScene.
 
-    When an observation term looks up an asset by name, this proxy lazily wraps
-    Articulation entities in _ArticulationProxy so their data getters annotate.
-    Non-Articulation entities are returned as-is.
+    When an observation term looks up a scene entity by name, this proxy lazily
+    wraps entities whose ``.data`` object exposes ``_leapp_semantics``-decorated
+    properties. This covers articulations and sensors through both
+    ``scene["name"]`` and ``scene.sensors["name"]`` access paths.
     """
 
-    def __init__(self, real_scene, annotating_getters: dict[str, callable], cache: dict):
+    def __init__(self, real_scene, annotating_getters_by_type: dict[type, dict[str, callable]], cache: dict):
         object.__setattr__(self, "_real_scene", real_scene)
-        object.__setattr__(self, "_annotating_getters", annotating_getters)
+        object.__setattr__(self, "_annotating_getters_by_type", annotating_getters_by_type)
         object.__setattr__(self, "_cache", cache)
         object.__setattr__(self, "_proxied", {})
+        object.__setattr__(self, "_sensor_mapping_proxy", None)
 
-    def __getitem__(self, key):
-        """Return an ArticulationProxy for Articulation entities, real entity otherwise."""
+    def _maybe_proxy_entity(self, key: str, entity: Any):
+        """Return a proxy for entities whose data object has annotated getters."""
         proxied = object.__getattribute__(self, "_proxied")
         if key in proxied:
             return proxied[key]
+
+        data = getattr(entity, "data", None)
+        if data is None:
+            return entity
+
+        annotating_getters_by_type = object.__getattribute__(self, "_annotating_getters_by_type")
+        if not _has_annotated_getters(annotating_getters_by_type, data):
+            return entity
+
+        cache = object.__getattribute__(self, "_cache")
+        data_proxy = _DataProxy(
+            data,
+            annotating_getters_by_type,
+            cache,
+            input_name_resolver=(
+                (lambda prop_name: f"ego_{prop_name}")
+                if isinstance(entity, Articulation)
+                else (lambda prop_name: f"{key}_{prop_name}")
+            ),
+        )
+        proxy = _EntityProxy(entity, data_proxy)
+        proxied[key] = proxy
+        return proxy
+
+    def __getitem__(self, key):
+        """Return a proxied entity when it exposes annotated data getters."""
         real_scene = object.__getattribute__(self, "_real_scene")
         entity = real_scene[key]
-        if isinstance(entity, Articulation):
-            getters = object.__getattribute__(self, "_annotating_getters")
-            cache = object.__getattribute__(self, "_cache")
-            data_proxy = _ArticulationDataProxy(entity.data, getters, cache)
-            proxy = _ArticulationProxy(entity, data_proxy)
-            proxied[key] = proxy
-            return proxy
-        return entity
+        return self._maybe_proxy_entity(key, entity)
+
+    @property
+    def sensors(self):
+        """Return a mapping proxy for scene sensors."""
+        sensor_mapping_proxy = object.__getattribute__(self, "_sensor_mapping_proxy")
+        if sensor_mapping_proxy is None:
+            real_scene = object.__getattribute__(self, "_real_scene")
+            sensor_mapping_proxy = _EntityMappingProxy(
+                real_scene.sensors,
+                object.__getattribute__(self, "_annotating_getters_by_type"),
+                object.__getattribute__(self, "_cache"),
+            )
+            object.__setattr__(self, "_sensor_mapping_proxy", sensor_mapping_proxy)
+        return sensor_mapping_proxy
 
     def __getattr__(self, name):
         """Forward all other scene access to the real scene."""
@@ -183,7 +317,7 @@ class _ArticulationWriteProxy:
     """Proxy around a real Articulation for action terms.
 
     Intercepts ``_leapp_semantics``-decorated write methods **and** routes
-    ``.data`` reads through a shared ``_ArticulationDataProxy`` so that
+    ``.data`` reads through a shared ``_DataProxy`` so that
     action-side state reads (e.g. ``self._asset.data.joint_pos`` inside
     ``RelativeJointPositionAction``) participate in LEAPP annotation and
     share the dedup cache with observation-side reads.
@@ -197,7 +331,7 @@ class _ArticulationWriteProxy:
         term_name: str,
         output_cache: list[TensorSemantics],
         annotating_methods: dict[str, callable],
-        data_proxy: _ArticulationDataProxy,
+        data_proxy: _DataProxy,
     ):
         object.__setattr__(self, "_real_asset", real_asset)
         object.__setattr__(self, "_term_name", term_name)
@@ -234,11 +368,11 @@ class ExportPatcher:
     shared dedup cache, then wires them into both:
 
     - The observation proxy chain (``_EnvProxy`` → ``_SceneProxy`` →
-      ``_ArticulationProxy`` → ``_ArticulationDataProxy``) for state reads
+      ``_EntityProxy`` → ``_DataProxy``) for state reads
       by observation term functions.
     - The ``_ArticulationWriteProxy`` on each action term, which intercepts
       target writes **and** routes ``.data`` reads through the same
-      ``_ArticulationDataProxy`` / cache.
+      ``_DataProxy`` / cache.
 
     This ensures that a property like ``joint_pos`` read by both an
     observation term and ``RelativeJointPositionAction.apply_actions()``
@@ -248,7 +382,7 @@ class ExportPatcher:
 
     def __init__(self, task_name: str):
         self.task_name = task_name
-        self._annotated_tensor_cache: dict[str, torch.Tensor] = {}
+        self._annotated_tensor_cache: dict[tuple[int, str], torch.Tensor] = {}
         self._action_output_cache: list[TensorSemantics] = []
         self._pending_action_output_export: bool = False
         self._uses_last_action_state: bool = False
@@ -274,33 +408,39 @@ class ExportPatcher:
 
     # ── Scanning ──────────────────────────────────────────────────
 
-    def _build_annotating_getters(self) -> dict[str, callable]:
-        """Scan ArticulationData for ``_leapp_semantics`` properties and build annotating getters.
+    def _build_annotating_getters(self) -> dict[type, dict[str, callable]]:
+        """Scan articulation and sensor data classes for ``_leapp_semantics`` properties.
 
-        Returns a dict mapping property name to a callable ``(data_self) -> annotated_tensor``.
+        Returns a dict mapping data class type to a dict of
+        ``property_name -> callable(data_self, input_name) -> annotated_tensor``.
         """
-        getters: dict[str, callable] = {}
-        for prop_name in dir(ArticulationData):
-            prop = getattr(ArticulationData, prop_name, None)
-            if isinstance(prop, property) and prop.fget and hasattr(prop.fget, "_leapp_semantics"):
-                getters[prop_name] = self._make_annotating_getter(prop.fget, prop_name)
+        getters: dict[type, dict[str, callable]] = {}
+        for data_cls in _ANNOTATED_DATA_CLASSES:
+            class_getters: dict[str, callable] = {}
+            for prop_name in dir(data_cls):
+                prop = getattr(data_cls, prop_name, None)
+                if isinstance(prop, property) and prop.fget and hasattr(prop.fget, "_leapp_semantics"):
+                    class_getters[prop_name] = self._make_annotating_getter(prop.fget, prop_name)
+            if class_getters:
+                getters[data_cls] = class_getters
         return getters
 
     def _make_annotating_getter(self, original_fget, prop_name: str):
-        """Create an annotating getter callable for a single ArticulationData property.
+        """Create an annotating getter callable for a single annotated data property.
 
         The returned callable invokes the real getter, then registers the result
-        as a LEAPP input tensor with the property's semantic metadata.
+        as a LEAPP input tensor with the property's semantic metadata and the
+        caller-supplied public input name.
         """
         task_name = self.task_name
 
-        def getter(data_self):
+        def getter(data_self, input_name: str):
             result = original_fget(data_self)
             if not isinstance(result, torch.Tensor):
                 return result
             semantics_meta = getattr(original_fget, "_leapp_semantics", None)
             sem = TensorSemantics(
-                name=prop_name,
+                name=input_name,
                 ref=result,
                 kind=semantics_meta.kind if semantics_meta else None,
                 element_names=resolve_leapp_element_names(semantics_meta, data_self),
@@ -402,7 +542,12 @@ class ExportPatcher:
             asset = getattr(term, "_asset", None)
             if isinstance(asset, Articulation):
                 real_asset: Articulation = asset
-                data_proxy = _ArticulationDataProxy(real_asset.data, annotating_getters, cache)
+                data_proxy = _DataProxy(
+                    real_asset.data,
+                    annotating_getters,
+                    cache,
+                    input_name_resolver=lambda prop_name: f"ego_{prop_name}",
+                )
                 term._asset = _ArticulationWriteProxy(
                     real_asset=real_asset,
                     term_name=term_name,

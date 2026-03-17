@@ -9,12 +9,15 @@ from __future__ import annotations
 import torch
 from dataclasses import dataclass
 
+from isaaclab.utils.leapp_semantics import leapp_tensor_semantics
+
 
 @dataclass
 class ContactSensorData:
     """Data container for the contact reporting sensor."""
 
-    pos_w: torch.Tensor | None = None
+    _body_names: list[str] | None = None
+    _pos_w: torch.Tensor | None = None
     """Position of the sensor origin in world frame.
 
     Shape is (N, 3), where N is the number of sensors.
@@ -24,7 +27,7 @@ class ContactSensorData:
 
     """
 
-    contact_pos_w: torch.Tensor | None = None
+    _contact_pos_w: torch.Tensor | None = None
     """Average of the positions of contact points between sensor body and filter prim in world frame.
 
     Shape is (N, B, M, 3), where N is the number of sensors, B is number of bodies in each sensor
@@ -43,7 +46,7 @@ class ContactSensorData:
 
     """
 
-    friction_forces_w: torch.Tensor | None = None
+    _friction_forces_w: torch.Tensor | None = None
     """Sum of the friction forces between sensor body and filter prim in world frame.
 
     Shape is (N, B, M, 3), where N is the number of sensors, B is number of bodies in each sensor
@@ -61,7 +64,7 @@ class ContactSensorData:
 
     """
 
-    quat_w: torch.Tensor | None = None
+    _quat_w: torch.Tensor | None = None
     """Orientation of the sensor origin in quaternion (w, x, y, z) in world frame.
 
     Shape is (N, 4), where N is the number of sensors.
@@ -70,7 +73,7 @@ class ContactSensorData:
         If the :attr:`ContactSensorCfg.track_pose` is False, then this quantity is None.
     """
 
-    net_forces_w: torch.Tensor | None = None
+    _net_forces_w: torch.Tensor | None = None
     """The net normal contact forces in world frame.
 
     Shape is (N, B, 3), where N is the number of sensors and B is the number of bodies in each sensor.
@@ -80,7 +83,7 @@ class ContactSensorData:
         with the total contact forces acting on the sensor bodies (which also includes the tangential forces).
     """
 
-    net_forces_w_history: torch.Tensor | None = None
+    _net_forces_w_history: torch.Tensor | None = None
     """The net normal contact forces in world frame.
 
     Shape is (N, T, B, 3), where N is the number of sensors, T is the configured history length
@@ -93,7 +96,7 @@ class ContactSensorData:
         with the total contact forces acting on the sensor bodies (which also includes the tangential forces).
     """
 
-    force_matrix_w: torch.Tensor | None = None
+    _force_matrix_w: torch.Tensor | None = None
     """The normal contact forces filtered between the sensor bodies and filtered bodies in world frame.
 
     Shape is (N, B, M, 3), where N is the number of sensors, B is number of bodies in each sensor
@@ -103,7 +106,7 @@ class ContactSensorData:
         If the :attr:`ContactSensorCfg.filter_prim_paths_expr` is empty, then this quantity is None.
     """
 
-    force_matrix_w_history: torch.Tensor | None = None
+    _force_matrix_w_history: torch.Tensor | None = None
     """The normal contact forces filtered between the sensor bodies and filtered bodies in world frame.
 
     Shape is (N, T, B, M, 3), where N is the number of sensors, T is the configured history length,
@@ -115,7 +118,7 @@ class ContactSensorData:
         If the :attr:`ContactSensorCfg.filter_prim_paths_expr` is empty, then this quantity is None.
     """
 
-    last_air_time: torch.Tensor | None = None
+    _last_air_time: torch.Tensor | None = None
     """Time spent (in s) in the air before the last contact.
 
     Shape is (N, B), where N is the number of sensors and B is the number of bodies in each sensor.
@@ -124,7 +127,7 @@ class ContactSensorData:
         If the :attr:`ContactSensorCfg.track_air_time` is False, then this quantity is None.
     """
 
-    current_air_time: torch.Tensor | None = None
+    _current_air_time: torch.Tensor | None = None
     """Time spent (in s) in the air since the last detach.
 
     Shape is (N, B), where N is the number of sensors and B is the number of bodies in each sensor.
@@ -133,7 +136,7 @@ class ContactSensorData:
         If the :attr:`ContactSensorCfg.track_air_time` is False, then this quantity is None.
     """
 
-    last_contact_time: torch.Tensor | None = None
+    _last_contact_time: torch.Tensor | None = None
     """Time spent (in s) in contact before the last detach.
 
     Shape is (N, B), where N is the number of sensors and B is the number of bodies in each sensor.
@@ -142,7 +145,7 @@ class ContactSensorData:
         If the :attr:`ContactSensorCfg.track_air_time` is False, then this quantity is None.
     """
 
-    current_contact_time: torch.Tensor | None = None
+    _current_contact_time: torch.Tensor | None = None
     """Time spent (in s) in contact since the last contact.
 
     Shape is (N, B), where N is the number of sensors and B is the number of bodies in each sensor.
@@ -150,3 +153,75 @@ class ContactSensorData:
     Note:
         If the :attr:`ContactSensorCfg.track_air_time` is False, then this quantity is None.
     """
+
+    @property
+    @leapp_tensor_semantics(kind="state/sensor/position", element_names_source="body_xyz")
+    def pos_w(self) -> torch.Tensor | None:
+        """Position of the sensor origin in world frame."""
+        return self._pos_w
+
+    @property
+    @leapp_tensor_semantics(kind="state/sensor/rotation", element_names_source="body_quat")
+    def quat_w(self) -> torch.Tensor | None:
+        """Orientation of the sensor origin in quaternion (w, x, y, z) in world frame."""
+        return self._quat_w
+
+    @property
+    @leapp_tensor_semantics(kind="state/contact_sensor/contact_position")
+    def contact_pos_w(self) -> torch.Tensor | None:
+        """Average contact positions in world frame."""
+        return self._contact_pos_w
+
+    @property
+    @leapp_tensor_semantics(kind="state/contact_sensor/friction_force")
+    def friction_forces_w(self) -> torch.Tensor | None:
+        """Friction forces between sensor body and filter prim in world frame."""
+        return self._friction_forces_w
+
+    @property
+    @leapp_tensor_semantics(kind="state/contact_sensor/net_force", element_names_source="body_xyz")
+    def net_forces_w(self) -> torch.Tensor | None:
+        """Net normal contact forces in world frame."""
+        return self._net_forces_w
+
+    @property
+    @leapp_tensor_semantics(kind="state/contact_sensor/net_force_history")
+    def net_forces_w_history(self) -> torch.Tensor | None:
+        """History of net normal contact forces in world frame."""
+        return self._net_forces_w_history
+
+    @property
+    @leapp_tensor_semantics(kind="state/contact_sensor/force_matrix")
+    def force_matrix_w(self) -> torch.Tensor | None:
+        """Filtered contact force matrix in world frame."""
+        return self._force_matrix_w
+
+    @property
+    @leapp_tensor_semantics(kind="state/contact_sensor/force_matrix_history")
+    def force_matrix_w_history(self) -> torch.Tensor | None:
+        """History of filtered contact force matrices in world frame."""
+        return self._force_matrix_w_history
+
+    @property
+    @leapp_tensor_semantics(kind="state/contact_sensor/last_air_time", element_names_source="body_names")
+    def last_air_time(self) -> torch.Tensor | None:
+        """Time spent in the air before the last contact."""
+        return self._last_air_time
+
+    @property
+    @leapp_tensor_semantics(kind="state/contact_sensor/current_air_time", element_names_source="body_names")
+    def current_air_time(self) -> torch.Tensor | None:
+        """Time spent in the air since the last detach."""
+        return self._current_air_time
+
+    @property
+    @leapp_tensor_semantics(kind="state/contact_sensor/last_contact_time", element_names_source="body_names")
+    def last_contact_time(self) -> torch.Tensor | None:
+        """Time spent in contact before the last detach."""
+        return self._last_contact_time
+
+    @property
+    @leapp_tensor_semantics(kind="state/contact_sensor/current_contact_time", element_names_source="body_names")
+    def current_contact_time(self) -> torch.Tensor | None:
+        """Time spent in contact since the last contact."""
+        return self._current_contact_time

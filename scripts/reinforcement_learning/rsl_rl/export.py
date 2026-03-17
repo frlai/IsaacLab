@@ -36,6 +36,12 @@ parser.add_argument(
     help="Use the pre-trained checkpoint from Nucleus.",
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+parser.add_argument(
+    "--disable_graph_visualization",
+    action="store_true",
+    default=False,
+    help="Disable LEAPP graph visualization during compile_graph().",
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -156,7 +162,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             obs, _, _, _ = env.step(actions)
 
     leapp.stop()
-    leapp.compile_graph()
+    leapp.compile_graph(visualize=not args_cli.disable_graph_visualization)
 
     # close the simulator
     env.close()

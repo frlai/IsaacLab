@@ -721,6 +721,7 @@ class ArticulationData:
         return self._body_com_pose_b.data
 
     @property
+    @leapp_tensor_semantics(kind="state/body/incoming_joint_wrench", element_names_source="body_wrench")
     def body_incoming_joint_wrench_b(self) -> torch.Tensor:
         """Joint reaction wrench applied from body parent to child body in parent body frame.
 

@@ -103,15 +103,15 @@ class Imu(SensorBase):
         if env_ids is None:
             env_ids = slice(None)
         # reset accumulative data buffers
-        self._data.pos_w[env_ids] = 0.0
-        self._data.quat_w[env_ids] = 0.0
-        self._data.quat_w[env_ids, 0] = 1.0
-        self._data.projected_gravity_b[env_ids] = 0.0
-        self._data.projected_gravity_b[env_ids, 2] = -1.0
-        self._data.lin_vel_b[env_ids] = 0.0
-        self._data.ang_vel_b[env_ids] = 0.0
-        self._data.lin_acc_b[env_ids] = 0.0
-        self._data.ang_acc_b[env_ids] = 0.0
+        self._data._pos_w[env_ids] = 0.0
+        self._data._quat_w[env_ids] = 0.0
+        self._data._quat_w[env_ids, 0] = 1.0
+        self._data._projected_gravity_b[env_ids] = 0.0
+        self._data._projected_gravity_b[env_ids, 2] = -1.0
+        self._data._lin_vel_b[env_ids] = 0.0
+        self._data._ang_vel_b[env_ids] = 0.0
+        self._data._lin_acc_b[env_ids] = 0.0
+        self._data._ang_acc_b[env_ids] = 0.0
         self._prev_lin_vel_w[env_ids] = 0.0
         self._prev_ang_vel_w[env_ids] = 0.0
 
@@ -198,8 +198,8 @@ class Imu(SensorBase):
         quat_w = quat_w.roll(1, dims=-1)
 
         # sensor pose in world: apply composed offset
-        self._data.pos_w[env_ids] = pos_w + math_utils.quat_apply(quat_w, self._offset_pos_b[env_ids])
-        self._data.quat_w[env_ids] = math_utils.quat_mul(quat_w, self._offset_quat_b[env_ids])
+        self._data._pos_w[env_ids] = pos_w + math_utils.quat_apply(quat_w, self._offset_pos_b[env_ids])
+        self._data._quat_w[env_ids] = math_utils.quat_mul(quat_w, self._offset_quat_b[env_ids])
 
         # COM of rigid source (body frame)
         com_pos_b = self._view.get_coms().to(self.device).split([3, 4], dim=-1)[0]
@@ -218,17 +218,17 @@ class Imu(SensorBase):
 
         # batch rotate world->body using current sensor orientation
         dynamics_data = torch.stack((lin_vel_w, ang_vel_w, lin_acc_w, ang_acc_w, self.GRAVITY_VEC_W[env_ids]), dim=0)
-        dynamics_data_rot = math_utils.quat_apply_inverse(self._data.quat_w[env_ids].repeat(5, 1), dynamics_data).chunk(
-            5, dim=0
-        )
+        dynamics_data_rot = math_utils.quat_apply_inverse(
+            self._data._quat_w[env_ids].repeat(5, 1), dynamics_data
+        ).chunk(5, dim=0)
         # store the velocities.
-        self._data.lin_vel_b[env_ids] = dynamics_data_rot[0]
-        self._data.ang_vel_b[env_ids] = dynamics_data_rot[1]
+        self._data._lin_vel_b[env_ids] = dynamics_data_rot[0]
+        self._data._ang_vel_b[env_ids] = dynamics_data_rot[1]
         # store the accelerations
-        self._data.lin_acc_b[env_ids] = dynamics_data_rot[2]
-        self._data.ang_acc_b[env_ids] = dynamics_data_rot[3]
+        self._data._lin_acc_b[env_ids] = dynamics_data_rot[2]
+        self._data._ang_acc_b[env_ids] = dynamics_data_rot[3]
         # store projected gravity
-        self._data.projected_gravity_b[env_ids] = dynamics_data_rot[4]
+        self._data._projected_gravity_b[env_ids] = dynamics_data_rot[4]
 
         self._prev_lin_vel_w[env_ids] = lin_vel_w
         self._prev_ang_vel_w[env_ids] = ang_vel_w
@@ -236,16 +236,16 @@ class Imu(SensorBase):
     def _initialize_buffers_impl(self):
         """Create buffers for storing data."""
         # data buffers
-        self._data.pos_w = torch.zeros(self._view.count, 3, device=self._device)
-        self._data.quat_w = torch.zeros(self._view.count, 4, device=self._device)
-        self._data.quat_w[:, 0] = 1.0
-        self._data.projected_gravity_b = torch.zeros(self._view.count, 3, device=self._device)
-        self._data.lin_vel_b = torch.zeros_like(self._data.pos_w)
-        self._data.ang_vel_b = torch.zeros_like(self._data.pos_w)
-        self._data.lin_acc_b = torch.zeros_like(self._data.pos_w)
-        self._data.ang_acc_b = torch.zeros_like(self._data.pos_w)
-        self._prev_lin_vel_w = torch.zeros_like(self._data.pos_w)
-        self._prev_ang_vel_w = torch.zeros_like(self._data.pos_w)
+        self._data._pos_w = torch.zeros(self._view.count, 3, device=self._device)
+        self._data._quat_w = torch.zeros(self._view.count, 4, device=self._device)
+        self._data._quat_w[:, 0] = 1.0
+        self._data._projected_gravity_b = torch.zeros(self._view.count, 3, device=self._device)
+        self._data._lin_vel_b = torch.zeros_like(self._data._pos_w)
+        self._data._ang_vel_b = torch.zeros_like(self._data._pos_w)
+        self._data._lin_acc_b = torch.zeros_like(self._data._pos_w)
+        self._data._ang_acc_b = torch.zeros_like(self._data._pos_w)
+        self._prev_lin_vel_w = torch.zeros_like(self._data._pos_w)
+        self._prev_ang_vel_w = torch.zeros_like(self._data._pos_w)
 
         # store sensor offset (applied relative to rigid source). This may be composed later with a fixed ancestor->target transform.
         self._offset_pos_b = torch.tensor(list(self.cfg.offset.pos), device=self._device).repeat(self._view.count, 1)

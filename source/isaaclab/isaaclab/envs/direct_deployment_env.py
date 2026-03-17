@@ -19,6 +19,8 @@ import yaml
 from dataclasses import dataclass
 from typing import Any
 
+from leapp import InferenceManager
+
 from isaaclab.assets.articulation.articulation import Articulation
 from isaaclab.assets.articulation.articulation_data import ArticulationData
 from isaaclab.managers import CommandManager, EventManager
@@ -173,7 +175,6 @@ class DirectDeploymentEnv:
             cfg: A ``ManagerBasedRLEnvCfg`` (or compatible) task config.
             leapp_yaml_path: Path to the LEAPP ``.yaml`` pipeline description.
         """
-        from leapp import InferenceManager
 
         cfg.scene.num_envs = 1
         cfg.validate()
@@ -215,10 +216,6 @@ class DirectDeploymentEnv:
         self._input_mapping: dict[str, StateInputSpec | CommandInputSpec] = {}
         self._output_mapping: dict[str, OutputSpec] = {}
         self._resolve_io()
-
-        # ── Cache feedback initial values for cheap reset ─────────
-        self._feedback_initial_values: dict[str, torch.Tensor] = {}
-        self._cache_feedback_initial_values()
 
         logger.info(
             "DirectDeploymentEnv ready — %d inputs, %d outputs mapped",
@@ -296,25 +293,6 @@ class DirectDeploymentEnv:
                 jids = _resolve_joint_ids(desc.get("element_names"), self._asset) if needs_joint_ids else None
                 self._output_mapping[key] = OutputSpec(method_name=method_name, joint_ids=jids)
 
-    # ── Feedback state caching ────────────────────────────────────
-
-    def _cache_feedback_initial_values(self):
-        """Snapshot the feedback input buffers right after InferenceManager init.
-
-        This allows ``reset()`` to cheaply restore feedback state without
-        re-instantiating the entire InferenceManager.
-        """
-        for fb_key in self.inference.feedback_inputs:
-            node_name, input_name = fb_key.split("/")
-            tensor = self.inference.value_dict[node_name][input_name]
-            self._feedback_initial_values[fb_key] = tensor.clone()
-
-    def _restore_feedback_initial_values(self):
-        """Restore feedback input buffers to their initial values."""
-        for fb_key, initial in self._feedback_initial_values.items():
-            node_name, input_name = fb_key.split("/")
-            self.inference.value_dict[node_name][input_name] = initial.clone()
-
     # ── Read / Write ──────────────────────────────────────────────
 
     def _read_inputs(self) -> dict[str, torch.Tensor]:
@@ -345,7 +323,7 @@ class DirectDeploymentEnv:
     # ── Public API ────────────────────────────────────────────────
 
     def reset(self) -> dict[str, torch.Tensor]:
-        """Reset the scene and feedback state.
+        """Reset the scene and inference state.
 
         Returns:
             The initial input tensors (for logging / debugging).
@@ -363,7 +341,7 @@ class DirectDeploymentEnv:
         self.sim.forward()
         self.scene.update(dt=self.physics_dt)
 
-        self._restore_feedback_initial_values()
+        self.inference.reset()
 
         return self._read_inputs()
 

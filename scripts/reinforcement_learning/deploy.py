@@ -24,9 +24,6 @@ parser = argparse.ArgumentParser(description="Deploy a LEAPP-exported policy in 
 parser.add_argument("--task", type=str, required=True, help="Name of the registered Isaac Lab task.")
 parser.add_argument("--leapp_model", type=str, required=True, help="Path to the LEAPP .yaml pipeline description.")
 parser.add_argument("--seed", type=int, default=None, help="Seed for the environment.")
-parser.add_argument(
-    "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
-)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 
