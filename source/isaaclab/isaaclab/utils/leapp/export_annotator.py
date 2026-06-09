@@ -45,11 +45,16 @@ from leapp.utils.tensor_description import TensorSemantics
 from isaaclab.assets.articulation.base_articulation import BaseArticulation
 from isaaclab.managers import ManagerTermBase
 
-from .leapp_semantics import select_element_names
+from .leapp_semantics import (
+    resolve_leapp_element_names,
+    resolve_leapp_observation_input_semantics,
+    select_element_names,
+)
 from .proxy import _ArticulationWriteProxy, _DataProxy, _EnvProxy, _ManagerTermProxy
 from .utils import (
     TracedProxyArray,
     build_command_connection,
+    build_observation_connection,
     build_write_connection,
 )
 
@@ -129,7 +134,7 @@ class ExportPatcher:
         )
 
         self._disable_training_managers(unwrapped)
-        self._patch_observation_manager(unwrapped.observation_manager, proxy_env)
+        self._patch_observation_manager(unwrapped.observation_manager, proxy_env, unwrapped)
         self._patch_history_buffers(unwrapped.observation_manager)
         self._patch_action_manager(
             unwrapped.action_manager,
@@ -272,25 +277,44 @@ class ExportPatcher:
         circular_buffer._leapp_original_append = original_append
         circular_buffer._append = patched_append
 
-    def _patch_observation_manager(self, obs_manager, proxy_env):
+    def _patch_observation_manager(self, obs_manager, proxy_env, real_env):
         """Patch observation terms to use annotating proxies and disable noise.
 
         Args:
             obs_manager: Observation manager instance to patch.
             proxy_env: Proxy environment routed into observation terms.
+            real_env: Unwrapped environment used for explicit observation inputs.
         """
+        term_names_by_group = getattr(obs_manager, "_group_obs_term_names", {})
         for group_name, term_cfgs in obs_manager._group_obs_term_cfgs.items():
             if self.required_obs_groups is not None and group_name not in self.required_obs_groups:
                 continue
-            for term_cfg in term_cfgs:
+            group_term_names = term_names_by_group.get(group_name, [])
+            for index, term_cfg in enumerate(term_cfgs):
                 original_func = term_cfg.func
                 func_name = getattr(original_func, "__name__", None)
+                term_name = group_term_names[index] if index < len(group_term_names) else func_name
+                observation_input_semantics = resolve_leapp_observation_input_semantics(original_func)
 
-                if func_name == "last_action":
+                if observation_input_semantics is not None:
+                    term_cfg.func = self._wrap_observation_input(
+                        original_func,
+                        real_env,
+                        group_name,
+                        term_name,
+                        observation_input_semantics,
+                        term_cfg,
+                    )
+                    term_cfg.modifiers = None
+                    term_cfg.clip = None
+                    term_cfg.scale = None
+                elif func_name == "last_action":
                     self._uses_last_action_state = True
                     term_cfg.func = self._wrap_last_action(original_func)
                 elif func_name == "generated_commands":
                     term_cfg.func = self._wrap_generated_commands(original_func, term_cfg)
+                elif func_name == "projected_gravity":
+                    term_cfg.func = self._wrap_projected_gravity(original_func, proxy_env)
                 else:
                     term_cfg.func = self._wrap_with_proxy(original_func, proxy_env)
 
@@ -305,6 +329,52 @@ class ExportPatcher:
             return original_compute(*args, **kwargs)
 
         obs_manager.compute = patched_compute
+
+    @staticmethod
+    def _apply_observation_post_processing(obs: torch.Tensor, term_cfg) -> torch.Tensor:
+        """Apply deterministic observation post-processing configured on a term."""
+        if term_cfg.modifiers is not None:
+            for modifier in term_cfg.modifiers:
+                obs = modifier.func(obs, **modifier.params)
+        if term_cfg.clip:
+            obs = obs.clip_(min=term_cfg.clip[0], max=term_cfg.clip[1])
+        if term_cfg.scale is not None:
+            obs = obs.mul_(term_cfg.scale)
+        return obs
+
+    def _wrap_observation_input(self, original_func, real_env, group_name: str, term_name: str, semantics, term_cfg):
+        """Wrap a full observation term as an explicit LEAPP input tensor.
+
+        Some policy inputs are task-level observation terms, not single raw
+        scene state properties. Calling the original term with the real env and
+        applying deterministic post-processing keeps the configured observation
+        boundary intact while making the term a live LEAPP deployment input.
+        """
+        task_name = self.task_name
+        element_names = resolve_leapp_element_names(semantics, original_func)
+
+        def wrapped(*args, **kwargs):
+            if args:
+                args = (real_env, *args[1:])
+            else:
+                args = (real_env,)
+            result = original_func(*args, **kwargs)
+            result = self._apply_observation_post_processing(result, term_cfg)
+            sem = TensorSemantics(
+                name=term_name,
+                ref=result,
+                kind=semantics.kind,
+                element_names=element_names,
+                extra=build_observation_connection(group_name, term_name),
+            )
+            return annotate.input_tensors(task_name, sem)
+
+        wrapped.__name__ = getattr(original_func, "__name__", term_name)
+        if hasattr(original_func, "reset"):
+            wrapped.reset = original_func.reset
+        if hasattr(original_func, "serialize"):
+            wrapped.serialize = original_func.serialize
+        return wrapped
 
     # ── Action manager patches ────────────────────────────────────
 
@@ -441,6 +511,34 @@ class ExportPatcher:
             else:
                 args = (proxy_env,)
             return original_func(*args, **kwargs)
+
+        wrapped.__name__ = getattr(original_func, "__name__", "unknown")
+        return wrapped
+
+    @staticmethod
+    def _wrap_projected_gravity(original_func, proxy_env):
+        """Wrap projected gravity as root-quaternion input plus fixed gravity projection.
+
+        Deployment backends generally provide body orientation, not an already
+        projected gravity vector. During export, keep the policy observation as
+        projected gravity while exposing ``root_quat_w`` at the LEAPP graph
+        boundary.
+        """
+
+        def wrapped(*args, **kwargs):
+            """Compute projected gravity from an annotated root quaternion input."""
+            kwargs.pop("inspect", None)
+            asset_cfg = kwargs.get("asset_cfg")
+            if asset_cfg is None and len(args) > 1:
+                asset_cfg = args[1]
+            asset_name = getattr(asset_cfg, "name", "robot")
+            root_quat_w = proxy_env.scene[asset_name].data.root_quat_w.torch
+            gravity_w = torch.zeros((*root_quat_w.shape[:-1], 3), dtype=root_quat_w.dtype, device=root_quat_w.device)
+            gravity_w[..., 2] = -1.0
+            quat_xyz = root_quat_w[..., :3]
+            quat_w = root_quat_w[..., 3:4]
+            t = torch.cross(quat_xyz, gravity_w, dim=-1) * 2.0
+            return gravity_w - quat_w * t + torch.cross(quat_xyz, t, dim=-1)
 
         wrapped.__name__ = getattr(original_func, "__name__", "unknown")
         return wrapped
