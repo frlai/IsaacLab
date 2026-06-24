@@ -15,7 +15,7 @@ from isaaclab.envs import mdp
 from isaaclab.test.mock_interfaces.assets.mock_articulation import MockArticulationData
 from isaaclab.utils import math as math_utils
 from isaaclab.utils.leapp import utils as leapp_utils
-from isaaclab.utils.leapp.export_annotator import ExportPatcher
+from isaaclab.utils.leapp.export_annotator import ExportPatcher, _effective_joint_gains
 from isaaclab.utils.leapp.leapp_semantics import InputKindEnum
 from isaaclab.utils.leapp.proxy import _DataProxy, _EnvProxy
 
@@ -37,6 +37,35 @@ def _make_articulation_data() -> tuple[MockArticulationData, torch.Tensor]:
     return data, root_pose_w
 
 
+def _make_explicit_pd_asset():
+    """Create a minimal articulation-like asset with explicit actuator PD gains."""
+    default_kp = torch.zeros(2, 4)
+    default_kd = torch.zeros(2, 4)
+    actuators = {
+        "hip_knee": SimpleNamespace(
+            joint_indices=[0, 2],
+            stiffness=torch.tensor([[11.0, 22.0], [33.0, 44.0]]),
+            damping=torch.tensor([[1.1, 2.2], [3.3, 4.4]]),
+        ),
+        "ankle": SimpleNamespace(
+            joint_indices=[1],
+            stiffness=torch.tensor([[55.0], [66.0]]),
+            damping=torch.tensor([[5.5], [6.6]]),
+        ),
+    }
+    asset = SimpleNamespace(
+        data=SimpleNamespace(
+            default_joint_stiffness=SimpleNamespace(torch=default_kp),
+            default_joint_damping=SimpleNamespace(torch=default_kd),
+        ),
+        actuators=actuators,
+        joint_names=["joint_0", "joint_1", "joint_2", "joint_3"],
+    )
+    expected_kp = torch.tensor([[11.0, 55.0, 22.0, 0.0], [33.0, 66.0, 44.0, 0.0]])
+    expected_kd = torch.tensor([[1.1, 5.5, 2.2, 0.0], [3.3, 6.6, 4.4, 0.0]])
+    return asset, expected_kp, expected_kd
+
+
 def _capture_leapp_inputs(monkeypatch: pytest.MonkeyPatch) -> list:
     """Capture LEAPP input annotations while returning their tensor references."""
     annotated_inputs = []
@@ -47,6 +76,42 @@ def _capture_leapp_inputs(monkeypatch: pytest.MonkeyPatch) -> list:
 
     monkeypatch.setattr(leapp_utils.annotate, "input_tensors", _record_input_tensor)
     return annotated_inputs
+
+
+def test_effective_joint_gains_use_explicit_actuator_pd_gains():
+    """Test explicit actuator gains override zero sim-level joint-drive gains."""
+    asset, expected_kp, expected_kd = _make_explicit_pd_asset()
+
+    kp_gains, kd_gains = _effective_joint_gains(asset)
+
+    torch.testing.assert_close(kp_gains, expected_kp)
+    torch.testing.assert_close(kd_gains, expected_kd)
+
+
+def test_action_static_outputs_export_effective_pd_gains_for_selected_joints():
+    """Test static LEAPP gain outputs use actuator PD gains and action-term joint ordering."""
+    asset, expected_kp, expected_kd = _make_explicit_pd_asset()
+    action_manager = SimpleNamespace(
+        _terms={
+            "joint_pos": SimpleNamespace(
+                _asset=SimpleNamespace(_real_asset=asset),
+                _joint_ids=[2, 0],
+            )
+        }
+    )
+    patcher = ExportPatcher(export_method="onnx-dynamo")
+    patcher._action_term_scene_keys["joint_pos"] = "robot"
+
+    static_outputs = patcher._collect_action_static_outputs(action_manager)
+
+    outputs_by_kind = {output.kind: output for output in static_outputs}
+    assert set(outputs_by_kind) == {"kp", "kd"}
+    assert outputs_by_kind["kp"].name == "joint_pos_kp_gains"
+    assert outputs_by_kind["kd"].name == "joint_pos_kd_gains"
+    assert outputs_by_kind["kp"].element_names == [["joint_2", "joint_0"]]
+    assert outputs_by_kind["kd"].element_names == [["joint_2", "joint_0"]]
+    torch.testing.assert_close(outputs_by_kind["kp"].ref, expected_kp[:, [2, 0]])
+    torch.testing.assert_close(outputs_by_kind["kd"].ref, expected_kd[:, [2, 0]])
 
 
 def test_direct_projected_gravity_b_read_preserves_vector3d_input(monkeypatch: pytest.MonkeyPatch):
